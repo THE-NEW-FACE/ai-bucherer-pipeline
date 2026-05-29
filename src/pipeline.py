@@ -176,6 +176,18 @@ def ingest(
                 classification=preset_class,        # None if no project supplied
             )
 
+    # Reconcile transient variants. Older manifests (and any pre-persistence run)
+    # recorded variant paths in an ephemeral local scratch dir that no longer exists
+    # — e.g. a previous cloud container's /tmp. Drop dangling references so the board
+    # and the detail view agree and the user is cleanly prompted to regenerate. We
+    # probe only the first variant per photo (they share a dir, so they live or die
+    # together) to keep this to one existence check per photo. The graded output is
+    # persisted separately, so `graded`/`output_path` are left untouched.
+    for photo in manifest.photos.values():
+        if photo.variants and not st.exists(photo.variants[0]):
+            photo.variants = []
+            photo.selected_variant = None
+
     st.makedirs(output_root)
     M.save(manifest, st)
     return manifest
@@ -306,10 +318,13 @@ def generate_variants_for(
     n = max(1, min(n, cfg.max_n))
 
     stem = Path(photo.input_path).stem
-    ws = workspace_dir(manifest.output_root, photo.product, stem)
-    if ws.exists():
-        shutil.rmtree(ws, ignore_errors=True)
-    ws.mkdir(parents=True, exist_ok=True)
+    # Variants are persisted through Storage (output_root/.variants/<product>/<stem>)
+    # so they survive process/container restarts — essential on the ephemeral cloud
+    # host, where a local /tmp scratch dir is wiped between sessions (which silently
+    # lost every variant). Clear any prior renders for this photo before writing new.
+    vdir = st.join(manifest.output_root, ".variants", photo.product, stem)
+    for old in st.list_files(vdir):
+        st.delete(old)
 
     # Gemini needs a real local file. reference_override may be a local workspace path
     # (already real) or a storage path; materialize handles both (no-op for local).
@@ -338,9 +353,9 @@ def generate_variants_for(
     for i, r in enumerate(batch.results):
         if r is None:
             continue
-        path = ws / f"variant_{i + 1:03d}.png"
-        path.write_bytes(r.image_bytes)
-        paths.append(str(path))
+        vp = st.join(vdir, f"variant_{i + 1:03d}.png")
+        st.write_bytes(vp, r.image_bytes)
+        paths.append(vp)
 
     # Lock the manifest mutation + save so parallel regenerates on different photos
     # don't lose total_cost_usd updates or corrupt the JSON write.
@@ -447,8 +462,9 @@ def select_variant(
         raise ValueError(f"variant_path {variant_path} not in current variants for {photo.photo_id}")
 
     st = get_storage(cfg)
-    # Variants live on local scratch — read directly.
-    src_bytes = Path(variant_path).read_bytes()
+    # Variants are persisted through Storage (see generate_variants_for) — read via
+    # the backend so this works for both local disk and Dropbox.
+    src_bytes = st.read_bytes(variant_path)
 
     hero_rgb = None
     hero_resolved = hero_path_for_photo(cfg, manifest, photo)
