@@ -1,0 +1,20 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "auto-pipeline",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "-m",
+        "streamlit",
+        "run",
+        "app.py",
+        "--server.port=8503",
+        "--server.headless=true",
+        "--browser.gatherUsageStats=false",
+        "--server.runOnSave=true"
+      ],
+      "port": 8503
+    }
+  ]
+}

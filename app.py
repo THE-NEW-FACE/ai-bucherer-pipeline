@@ -1,0 +1,2292 @@
+"""
+Auto Pipeline — Streamlit UI.
+
+Run: streamlit run app.py
+Or:  double-click run_pipeline.bat
+
+Routes (st.session_state["route"]):
+  "landing"  — pick a saved project or create a new one
+  "create"   — new-project wizard (folders + per-product briefs)
+  "loading"  — first-run auto-prepare progress bar
+  "board"    — Pinterest-style board view (default after a project is loaded)
+  "detail"   — per-photo detail view (edit prompt, regenerate, pick variant, regrade)
+"""
+
+from __future__ import annotations
+
+import base64
+import functools
+import sys
+from io import BytesIO
+from pathlib import Path
+
+import streamlit as st
+from PIL import Image
+from streamlit_autorefresh import st_autorefresh
+
+# Make `from src.* import ...` work when launched via `streamlit run app.py`
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from src import manifest as M  # noqa: E402
+from src import project as PROJ  # noqa: E402
+from src.anthropic_client import AnthropicClient  # noqa: E402
+from src.config import load_config  # noqa: E402
+from src.gemini_client import GeminiClient  # noqa: E402
+from src import pipeline as P  # noqa: E402
+
+
+# ═══ Page setup ══════════════════════════════════════════════════════════
+
+st.set_page_config(
+    layout="wide",
+    page_title="AI Bucherer · Auto Pipeline",
+    page_icon="🎬",
+    initial_sidebar_state="expanded",
+)
+
+# ─── Design system ────────────────────────────────────────────────────────
+# Modeled after Linear / Vercel / Notion: limited color palette, 8-point grid,
+# restrained typography hierarchy, subtle borders, accent-only highlights.
+# All Streamlit chrome overridden so the app reads as one consistent surface,
+# not "form-on-form-on-form".
+st.markdown(
+    """
+    <style>
+    :root {
+      /* ── Color tokens ── */
+      --bg-base: #0E0E10;
+      --bg-elev-1: #16161A;
+      --bg-elev-2: #1F1F25;
+      --bg-elev-3: #2A2A33;
+
+      --border-subtle: rgba(255,255,255,0.06);
+      --border: rgba(255,255,255,0.10);
+      --border-strong: rgba(255,255,255,0.16);
+
+      --text: #E8E8EA;
+      --text-2: #A0A0AB;
+      --text-3: #6B6B73;
+      --text-disabled: #4B4B53;
+
+      --accent: #D4A857;
+      --accent-hover: #E8B968;
+      --accent-muted: rgba(212,168,87,0.14);
+      --accent-ring: rgba(212,168,87,0.30);
+
+      --success: #4ADE80; --success-bg: rgba(74,222,128,0.10); --success-border: rgba(74,222,128,0.20);
+      --warning: #FBBF24; --warning-bg: rgba(251,191,36,0.10); --warning-border: rgba(251,191,36,0.24);
+      --error:   #F87171; --error-bg:   rgba(248,113,113,0.10); --error-border:   rgba(248,113,113,0.22);
+      --info:    #60A5FA; --info-bg:    rgba(96,165,250,0.10);  --info-border:    rgba(96,165,250,0.22);
+
+      /* ── Spacing (4/8 grid) ── */
+      --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px;
+      --s-5: 24px; --s-6: 32px; --s-7: 48px; --s-8: 64px;
+
+      /* ── Radius ── */
+      --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-xl: 16px;
+
+      /* ── Type ── */
+      --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Inter", sans-serif;
+      --mono: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+
+      /* ── Motion ── */
+      --t-fast: 100ms ease;
+      --t: 150ms ease;
+    }
+
+    /* ── Base ── */
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"] {
+      background: var(--bg-base) !important;
+      color: var(--text);
+      font-family: var(--font);
+    }
+    .block-container {
+      padding-top: var(--s-5) !important;
+      padding-bottom: var(--s-7) !important;
+      max-width: 1440px !important;
+    }
+
+    /* ── Streamlit chrome cleanup ── */
+    header[data-testid="stHeader"] { background: transparent; height: 0; }
+    button[kind="header"], #MainMenu, footer, [data-testid="stToolbar"] { display: none !important; }
+    [data-testid="stDecoration"] { display: none; }
+    /* Strip the auto-generated header anchor links that produced "Link to heading" noise */
+    [data-testid="stHeaderActionElements"] { display: none !important; }
+
+    /* ── Type scale ── */
+    h1, [data-testid="stHeading"] h1 {
+      font-size: 28px !important; font-weight: 600 !important;
+      line-height: 1.2 !important; letter-spacing: -0.01em !important;
+      color: var(--text) !important;
+      margin: 0 0 var(--s-2) 0 !important;
+    }
+    h2, [data-testid="stHeading"] h2 {
+      font-size: 22px !important; font-weight: 600 !important;
+      line-height: 1.3 !important; color: var(--text) !important;
+      margin: var(--s-6) 0 var(--s-3) 0 !important;
+    }
+    h3, [data-testid="stHeading"] h3 {
+      font-size: 16px !important; font-weight: 600 !important;
+      line-height: 1.4 !important; color: var(--text) !important;
+      margin: var(--s-5) 0 var(--s-2) 0 !important;
+    }
+    h4, h5, [data-testid="stHeading"] h4, [data-testid="stHeading"] h5 {
+      font-size: 11px !important; font-weight: 600 !important;
+      color: var(--text-3) !important;
+      text-transform: uppercase !important; letter-spacing: 0.06em !important;
+      margin: var(--s-4) 0 var(--s-2) 0 !important;
+    }
+    p, [data-testid="stMarkdownContainer"] p { color: var(--text); line-height: 1.55; font-size: 14px; }
+    [data-testid="stCaptionContainer"], small {
+      color: var(--text-3) !important; font-size: 12px !important;
+    }
+
+    /* ── Inline code: subtle, not bright green ── */
+    code, [data-testid="stMarkdownContainer"] code, [data-testid="stCode"] {
+      background: var(--bg-elev-2) !important;
+      color: var(--text-2) !important;
+      border: 1px solid var(--border-subtle);
+      border-radius: 4px !important;
+      padding: 1px 6px !important;
+      font-size: 12px !important;
+      font-family: var(--mono) !important;
+    }
+
+    /* ── Buttons ── */
+    .stButton > button {
+      background: transparent !important;
+      color: var(--text) !important;
+      border: 1px solid var(--border) !important;
+      border-radius: var(--r-md) !important;
+      font-weight: 500 !important;
+      font-size: 13px !important;
+      padding: 6px 14px !important;
+      height: 34px !important;
+      min-height: 34px !important;
+      line-height: 1 !important;
+      transition: background var(--t), border-color var(--t), color var(--t), transform var(--t-fast) !important;
+      box-shadow: none !important;
+    }
+    /* (Board-controls overrides live further down, near the .board-card rules.) */
+    .stButton > button:hover {
+      background: var(--bg-elev-2) !important;
+      border-color: var(--border-strong) !important;
+    }
+    .stButton > button:active { transform: translateY(1px); }
+    .stButton > button:focus-visible {
+      outline: 2px solid var(--accent) !important;
+      outline-offset: 2px;
+    }
+    .stButton > button[kind="primary"] {
+      background: var(--accent) !important;
+      color: #1A1208 !important;
+      border-color: var(--accent) !important;
+      font-weight: 600 !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+      background: var(--accent-hover) !important;
+      border-color: var(--accent-hover) !important;
+    }
+    .stButton > button:disabled {
+      opacity: 0.35 !important; cursor: not-allowed;
+      background: transparent !important;
+    }
+
+    /* ── Inputs ── */
+    .stTextInput input, .stTextArea textarea,
+    .stNumberInput input, [data-baseweb="input"] input,
+    [data-baseweb="textarea"] textarea {
+      background: var(--bg-elev-1) !important;
+      border: 1px solid var(--border) !important;
+      border-radius: var(--r-md) !important;
+      color: var(--text) !important;
+      font-size: 14px !important;
+      transition: border-color var(--t), box-shadow var(--t);
+    }
+    .stTextInput input:focus, .stTextArea textarea:focus,
+    .stNumberInput input:focus, [data-baseweb="input"] input:focus,
+    [data-baseweb="textarea"] textarea:focus {
+      border-color: var(--accent) !important;
+      box-shadow: 0 0 0 3px var(--accent-ring) !important;
+      outline: none !important;
+    }
+    .stTextInput input::placeholder, .stTextArea textarea::placeholder,
+    [data-baseweb="input"] input::placeholder, [data-baseweb="textarea"] textarea::placeholder {
+      color: var(--text-3) !important;
+    }
+    label, [data-testid="stWidgetLabel"] p {
+      color: var(--text-2) !important;
+      font-size: 13px !important;
+      font-weight: 500 !important;
+    }
+
+    /* ── Selectbox ── */
+    .stSelectbox [data-baseweb="select"] > div {
+      background: var(--bg-elev-1) !important;
+      border: 1px solid var(--border) !important;
+      border-radius: var(--r-md) !important;
+      color: var(--text) !important;
+      min-height: 34px !important;
+    }
+    [data-baseweb="popover"] [role="listbox"] {
+      background: var(--bg-elev-2) !important;
+      border: 1px solid var(--border) !important;
+      border-radius: var(--r-md) !important;
+    }
+    [data-baseweb="popover"] [role="option"]:hover {
+      background: var(--bg-elev-3) !important;
+    }
+
+    /* ── Slider ── */
+    [data-baseweb="slider"] [role="slider"] {
+      background: var(--accent) !important;
+      border: 2px solid var(--accent-hover) !important;
+      box-shadow: 0 0 0 4px rgba(212,168,87,0.18) !important;
+      height: 16px !important; width: 16px !important;
+    }
+    [data-baseweb="slider"] div[style*="background"] {
+      background: var(--bg-elev-3) !important;
+    }
+    [data-baseweb="slider"] div[role="presentation"] > div:first-child {
+      background: var(--accent) !important;
+    }
+
+    /* ── Radio (segmented) ── */
+    [data-testid="stRadio"] label[role="radio"] {
+      background: transparent !important;
+      padding: 4px 0 !important;
+    }
+
+    /* ── File uploader ── */
+    [data-testid="stFileUploaderDropzone"], [data-testid="stFileUploader"] section {
+      background: var(--bg-elev-1) !important;
+      border: 1px dashed var(--border) !important;
+      border-radius: var(--r-md) !important;
+      transition: border-color var(--t), background var(--t);
+    }
+    [data-testid="stFileUploaderDropzone"]:hover {
+      border-color: var(--accent) !important;
+      background: var(--bg-elev-2) !important;
+    }
+
+    /* ── Sidebar ── */
+    [data-testid="stSidebar"] {
+      background: var(--bg-elev-1) !important;
+      border-right: 1px solid var(--border-subtle) !important;
+    }
+    [data-testid="stSidebar"] .block-container {
+      padding: var(--s-5) var(--s-4) var(--s-6) var(--s-4) !important;
+    }
+    [data-testid="stSidebar"] hr {
+      border-color: var(--border-subtle) !important;
+      margin: var(--s-4) 0 !important;
+    }
+    /* Sidebar's nested containers shouldn't have card backgrounds */
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div {
+      background: transparent !important;
+    }
+
+    /* ── Bordered containers (st.container(border=True)) ── */
+    [data-testid="stVerticalBlockBorderWrapper"] {
+      border: 1px solid var(--border-subtle) !important;
+      background: var(--bg-elev-1) !important;
+      border-radius: var(--r-lg) !important;
+      padding: var(--s-4) !important;
+      transition: border-color var(--t), background var(--t);
+    }
+    [data-testid="stVerticalBlockBorderWrapper"]:hover {
+      border-color: var(--border) !important;
+    }
+
+    /* ── Expander ── */
+    [data-testid="stExpander"] {
+      border: 1px solid var(--border-subtle) !important;
+      border-radius: var(--r-md) !important;
+      background: var(--bg-elev-1) !important;
+    }
+    [data-testid="stExpander"] summary {
+      font-size: 13px !important; color: var(--text-2) !important;
+      padding: var(--s-3) var(--s-4) !important;
+    }
+    [data-testid="stExpander"] summary:hover { color: var(--text) !important; }
+
+    /* ── Metric (compact) ── */
+    [data-testid="stMetric"] {
+      background: transparent !important; padding: 0 !important;
+    }
+    [data-testid="stMetricLabel"] p, [data-testid="stMetricLabel"] {
+      color: var(--text-3) !important;
+      font-size: 11px !important;
+      text-transform: uppercase !important;
+      letter-spacing: 0.06em !important;
+      font-weight: 600 !important;
+    }
+    [data-testid="stMetricValue"] {
+      color: var(--text) !important;
+      font-size: 22px !important;
+      font-weight: 600 !important;
+      line-height: 1.2 !important;
+    }
+
+    /* ── Progress bar ── */
+    [data-testid="stProgress"] > div > div > div > div {
+      background: var(--accent) !important;
+    }
+    [data-testid="stProgress"] > div > div > div {
+      background: var(--bg-elev-3) !important;
+      border-radius: 999px !important;
+    }
+
+    /* ── Alerts ── */
+    [data-testid="stAlert"] {
+      border-radius: var(--r-md) !important;
+      border: 1px solid var(--border) !important;
+      padding: var(--s-3) var(--s-4) !important;
+    }
+    [data-baseweb="notification"][kind="info"]    { background: var(--info-bg) !important;    border-color: var(--info-border) !important;    color: var(--info) !important; }
+    [data-baseweb="notification"][kind="warning"] { background: var(--warning-bg) !important; border-color: var(--warning-border) !important; color: var(--warning) !important; }
+    [data-baseweb="notification"][kind="error"]   { background: var(--error-bg) !important;   border-color: var(--error-border) !important;   color: var(--error) !important; }
+    [data-baseweb="notification"][kind="success"] { background: var(--success-bg) !important; border-color: var(--success-border) !important; color: var(--success) !important; }
+
+    /* ── Dialog (lightbox / compare) ── */
+    div[role="dialog"], div[data-testid="stDialog"] {
+      background: var(--bg-elev-1) !important;
+      border: 1px solid var(--border) !important;
+      border-radius: var(--r-xl) !important;
+      max-width: 96vw !important;
+      width: 96vw !important;
+    }
+    div[role="dialog"] [data-testid="stImage"] img,
+    div[data-testid="stDialog"] [data-testid="stImage"] img {
+      max-height: 82vh !important; height: auto !important;
+      width: auto !important; max-width: 100% !important;
+      object-fit: contain; margin: 0 auto; display: block;
+      border-radius: var(--r-md);
+    }
+
+    /* ── Image rounding everywhere ── */
+    [data-testid="stImage"] img {
+      border-radius: var(--r-md);
+    }
+
+    /* ── Toast ── */
+    [data-testid="stToast"] {
+      background: var(--bg-elev-2) !important;
+      color: var(--text) !important;
+      border: 1px solid var(--border) !important;
+      border-radius: var(--r-md) !important;
+    }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: var(--bg-base); }
+    ::-webkit-scrollbar-thumb { background: var(--bg-elev-2); border-radius: 5px; border: 2px solid var(--bg-base); }
+    ::-webkit-scrollbar-thumb:hover { background: var(--bg-elev-3); }
+
+    /* ════════════════════════════════════════════════════════════════════ */
+    /* App-specific component styles                                        */
+    /* ════════════════════════════════════════════════════════════════════ */
+
+    /* ── Badges ── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      height: 22px;
+      padding: 0 8px;
+      font-size: 11px;
+      font-weight: 500;
+      border-radius: 999px;
+      background: var(--bg-elev-2);
+      color: var(--text-2);
+      border: 1px solid var(--border-subtle);
+      letter-spacing: 0.01em;
+      vertical-align: middle;
+      margin-right: 6px;
+      white-space: nowrap;
+      line-height: 1;
+    }
+    .badge-worn { background: var(--info-bg); color: var(--info); border-color: var(--info-border); }
+    .badge-packshot { background: var(--accent-muted); color: var(--accent); border-color: rgba(212,168,87,0.28); }
+    .badge-ready { background: var(--success-bg); color: var(--success); border-color: var(--success-border); }
+    .badge-error { background: var(--error-bg); color: var(--error); border-color: var(--error-border); font-weight: 600; }
+    .badge-running {
+      background: var(--warning-bg); color: var(--warning); border-color: var(--warning-border); font-weight: 600;
+    }
+    /* Pulse for in-flight badges */
+    @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .badge-running::before {
+      content: ""; display: inline-block;
+      width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor; margin-right: 6px;
+      animation: pulse-dot 1.4s ease-in-out infinite;
+    }
+
+    /* ── Project tiles (landing) ── */
+    .project-tile {
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--r-lg);
+      padding: var(--s-4) var(--s-5);
+      background: var(--bg-elev-1);
+      transition: background var(--t), border-color var(--t);
+    }
+    .project-tile:hover {
+      background: var(--bg-elev-2);
+      border-color: var(--border);
+    }
+
+    /* ── Board card toolbar — borderless icon buttons unified with the chip ──
+       Visual goal: a single clean toolbar row reading as one element,
+       not four boxy outlined buttons. Inspired by the Gemini variant card
+       (subtle icons + inline count, minimal chrome).
+       Buttons are borderless transparent, hover only adds a soft fill. ── */
+    /* Streamlit renders st.container(key="boardctrls-<id>") with a real wrapping
+       div whose class contains "st-key-boardctrls-<id>". We target that — a bare
+       <div class="board-controls"> emitted via st.markdown does NOT wrap the
+       sibling button columns, so its descendant selectors never match. */
+    /* Use a descendant combinator (.stButton button, not > button): buttons with
+       a help tooltip are nested under an extra stTooltipHoverTarget span, so the
+       direct-child selector misses them. */
+    div[class*="st-key-boardctrls"] { margin: 8px 0 4px 0; }
+    div[class*="st-key-boardctrls"] .stButton button {
+      padding: 0 8px !important;
+      font-size: 14px !important;
+      height: 30px !important;
+      min-height: 30px !important;
+      border-radius: var(--r-sm) !important;
+      color: var(--text-2) !important;
+      background: transparent !important;
+      border: 1px solid transparent !important;
+      box-shadow: none !important;
+    }
+    div[class*="st-key-boardctrls"] .stButton button:hover {
+      color: var(--text) !important;
+      background: var(--bg-elev-2) !important;
+      border-color: var(--border-subtle) !important;
+    }
+    div[class*="st-key-boardctrls"] .stButton button:disabled {
+      color: var(--text-disabled) !important;
+      background: transparent !important;
+      border-color: transparent !important;
+      opacity: 0.3 !important;
+    }
+    div[class*="st-key-boardctrls"] .stButton button:focus-visible {
+      outline: 2px solid var(--accent) !important;
+      outline-offset: -2px;
+    }
+
+    /* ── Square board thumbnails — each board card's image is wrapped in
+       st.container(key="boardimg-<id>"), which Streamlit renders with a real
+       "st-key-boardimg-*" class. Force the <img> to a 1:1 crop so the 4-column
+       grid stays tidy regardless of source aspect ratio. */
+    div[class*="st-key-boardimg"] img {
+      aspect-ratio: 1 / 1 !important;
+      object-fit: cover !important;
+      width: 100% !important;
+      display: block;
+      border-radius: var(--r-md);
+    }
+    /* Exempt zero-size iframes (autorefresh) — never force aspect-ratio on those */
+    iframe[width="0"], iframe[height="0"] {
+      aspect-ratio: auto !important;
+      height: 0 !important;
+      width: 0 !important;
+    }
+    /* Variant indicator chip "2 / 4" — the focal control. Slightly larger
+       than icon buttons so it visually anchors the toolbar. */
+    .var-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 30px;
+      min-width: 64px;
+      padding: 0 14px;
+      border-radius: 999px;
+      background: var(--bg-elev-2);
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 500;
+      border: 1px solid var(--border-subtle);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.01em;
+    }
+    .var-chip-picked {
+      background: var(--success-bg);
+      color: var(--success);
+      border-color: var(--success-border);
+    }
+    .var-chip-empty {
+      background: transparent;
+      color: var(--text-3);
+      border-color: var(--border-subtle);
+      font-style: italic;
+    }
+    .var-chip-running {
+      background: var(--warning-bg);
+      color: var(--warning);
+      border-color: var(--warning-border);
+    }
+
+    /* ── Tiny utility classes ── */
+    .row { display: flex; align-items: center; gap: var(--s-2); }
+    .row-wrap { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; }
+    .muted { color: var(--text-2); }
+    .subtle { color: var(--text-3); }
+    .nowrap { white-space: nowrap; }
+    .stack-1 > * + * { margin-top: var(--s-1) !important; }
+    .stack-2 > * + * { margin-top: var(--s-2) !important; }
+
+    /* ── Hide horizontal rules in main content (use spacing instead) ── */
+    [data-testid="stAppViewContainer"] hr {
+      border: 0;
+      border-top: 1px solid var(--border-subtle);
+      margin: var(--s-5) 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ═══ Config + clients ════════════════════════════════════════════════════
+
+cfg = load_config()
+
+
+@st.cache_resource(show_spinner=False)
+def get_anthropic_client():
+    return AnthropicClient(cfg)
+
+
+@st.cache_resource(show_spinner=False)
+def get_gemini_client():
+    return GeminiClient(cfg)
+
+
+# ═══ Route helpers ═══════════════════════════════════════════════════════
+
+def set_route(route: str, **extras):
+    st.session_state["route"] = route
+    for k, v in extras.items():
+        st.session_state[k] = v
+
+
+def current_route() -> str:
+    return st.session_state.get("route", "landing")
+
+
+# ═══ Helpers (dialogs, thumbnails, compliance) ═══════════════════════════
+
+@st.dialog("Full-size view", width="large")
+def _show_fullscreen(image_path: str, caption: str = ""):
+    p = Path(image_path)
+    if not p.exists():
+        st.error(f"File not found: {p}")
+        return
+    img = Image.open(p)
+    if caption:
+        st.markdown(f"**{caption}**")
+    try:
+        st.image(img, use_container_width=True)
+    except TypeError:
+        st.image(img, width="stretch")
+    st.caption(f"{img.size[0]}×{img.size[1]} px · {p.stat().st_size // 1024} KB · `{p}`")
+
+
+@st.dialog("Before / After", width="large")
+def _show_comparison(
+    before_path: str,
+    after_path: str,
+    before_label: str = "Before",
+    after_label: str = "After",
+    title: str = "",
+):
+    """Fast hover-position compare slider in a dialog.
+
+    Replaces streamlit-image-comparison (which re-encodes both images as PNG and
+    pushes a multi-MB payload to the component, taking 3–8s on 2K images). Ours
+    reuses the same cached data-URL pipeline as the board, so opening this dialog
+    is near-instant — the cached JPEGs are already in memory.
+    """
+    bp, ap = Path(before_path), Path(after_path)
+    if not bp.exists() or not ap.exists():
+        st.error(f"Missing image(s):\nbefore: {bp}\nafter: {ap}")
+        return
+    if title:
+        st.markdown(f"**{title}**")
+
+    from streamlit.components.v1 import html as st_html
+    # Larger max_edge for the modal (still 1280 — full-res 2K is overkill here)
+    html_payload = render_hover_card_html(
+        str(bp), str(ap), height_px=560, max_edge=1280,
+    )
+    st_html(html_payload, height=576, scrolling=False)
+
+    # Footer caption — pull real dimensions from disk header only (cheap)
+    try:
+        with Image.open(bp) as ib, Image.open(ap) as ia:
+            bw, bh = ib.size
+            aw, ah = ia.size
+        st.caption(
+            f"**{before_label}** {bw}×{bh}px · "
+            f"**{after_label}** {aw}×{ah}px · "
+            f"move mouse left↔right to compare"
+        )
+    except Exception:
+        st.caption(f"**{before_label}** ↔ **{after_label}** · move mouse left↔right to compare")
+
+
+_PACKSHOT_REQUIRED_SECTIONS = (
+    "PRIMARY DIRECTIVE", "PRESERVE FROM", "METAL", "BACKGROUND",
+    "LIGHTING", "CAMERA", "STYLE",
+)
+_PACKSHOT_WORD_TARGET = (550, 700)
+_WORN_REQUIRED_SECTIONS = (
+    "PRIMARY DIRECTIVE", "PRESERVE FROM", "JEWELRY", "GENERATE FRESH",
+    "SKIN", "JAW AND CHEEK", "NECK AND THROAT", "DÉCOLLETAGE",
+    "Lips", "Hair", "Ears", "Clothing", "Background", "Lighting", "Style",
+)
+_WORN_WORD_TARGET = (900, 1100)
+
+
+def _render_prompt_compliance(photo: "M.PhotoState") -> None:
+    prompt = photo.prompt or ""
+    words = len(prompt.split())
+    is_worn = photo.classification == "worn"
+    lo, hi = _WORN_WORD_TARGET if is_worn else _PACKSHOT_WORD_TARGET
+    required = _WORN_REQUIRED_SECTIONS if is_worn else _PACKSHOT_REQUIRED_SECTIONS
+    present = sum(1 for s in required if s in prompt)
+    word_ok = lo <= words <= hi
+    section_ok = present == len(required)
+    word_glyph = "✓" if word_ok else ("↑" if words > hi else "↓")
+    sec_glyph = "✓" if section_ok else "⚠"
+    word_color = "#1a7f37" if word_ok else ("#9a6700" if abs(words - (lo + hi) / 2) < (hi - lo) else "#cf222e")
+    sec_color = "#1a7f37" if section_ok else "#cf222e"
+    st.markdown(
+        f"<span style='font-size:0.85em;color:#666'>"
+        f"<span style='color:{word_color};font-weight:600'>{word_glyph} {words} words</span> "
+        f"(target {lo}–{hi}) · "
+        f"<span style='color:{sec_color};font-weight:600'>{sec_glyph} {present}/{len(required)} sections</span>"
+        f"</span>",
+        unsafe_allow_html=True,
+    )
+
+
+def _sync_card_widgets_if_stale(photo: "M.PhotoState") -> None:
+    """Push manifest changes into widget session_state BEFORE keyed widgets render."""
+    prompt_key = f"prompt_{photo.photo_id}"
+    prompt_marker = f"__sync_prompt_{photo.photo_id}"
+    if st.session_state.get(prompt_marker) != photo.prompt:
+        st.session_state[prompt_key] = photo.prompt or ""
+        st.session_state[prompt_marker] = photo.prompt
+
+    class_key = f"class_{photo.photo_id}"
+    class_marker = f"__sync_class_{photo.photo_id}"
+    if st.session_state.get(class_marker) != photo.classification:
+        st.session_state[class_key] = photo.classification or "packshot"
+        st.session_state[class_marker] = photo.classification
+
+
+def thumb(
+    image_path: str | Path,
+    width: int = 220,
+    caption: str | None = None,
+    fs_key: str | None = None,
+    fs_caption: str | None = None,
+):
+    p = Path(image_path)
+    if not p.exists():
+        st.caption(f"_(missing: {p.name})_")
+        return
+    try:
+        img = Image.open(p)
+        st.image(img, width=width, caption=caption)
+    except Exception as e:
+        st.caption(f"_(can't open {p.name}: {e})_")
+        return
+    if fs_key:
+        if st.button("🔍 Full size", key=fs_key, use_container_width=True,
+                     help="Open in lightbox at near-viewport resolution"):
+            _show_fullscreen(str(p), fs_caption or caption or p.name)
+
+
+# ═══ Hover-slider component (board cards) ════════════════════════════════
+
+# Performance-critical: the board re-renders every autorefresh tick (1.5s while any
+# background task is running). Without caching, each tick re-decodes + JPEG-encodes
+# every visible card's images, which freezes the UI on a 20-photo project.
+# We cache by (path, mtime, max_edge) so file edits invalidate naturally.
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def _cached_data_url(path_str: str, mtime: float, max_edge: int) -> str:
+    """Cached version of _image_to_data_url. mtime is the cache key — when the file is
+    rewritten (e.g. after grading), the cache entry is invalidated automatically.
+    Returns a base64 data URL of the downscaled JPEG."""
+    try:
+        img = Image.open(path_str).convert("RGB")
+        if max(img.size) > max_edge:
+            scale = max_edge / max(img.size)
+            img = img.resize(
+                (int(img.size[0] * scale), int(img.size[1] * scale)),
+                Image.LANCZOS,
+            )
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=82, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYGD4DwABBQEAU"
+            "h0bygAAAABJRU5ErkJggg=="
+        )
+
+
+def _image_to_data_url(path: Path, max_edge: int = 900) -> str:
+    """Public wrapper — picks up mtime so the cache invalidates on file rewrite."""
+    try:
+        mtime = Path(path).stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return _cached_data_url(str(path), mtime, max_edge)
+
+
+def _render_wizard_thumb_strip(folder_path: Path, total_images: int) -> None:
+    """Inline horizontal thumbnails for the project-creation wizard so the user
+    can actually see what they're describing. Pure HTML — uses the cached data-URL
+    pipeline, so each thumbnail is computed once and reused across all reruns.
+
+    Renders up to 4 thumbs at ~108px square. If the folder has more images, a
+    small caption flags the count. A separate "🔍 View all" button sits below the
+    strip so the user can pop the full set into the lightbox for closer inspection.
+    """
+    if not folder_path.exists():
+        st.caption("_(folder missing)_")
+        return
+
+    all_imgs = sorted(
+        p for p in folder_path.iterdir()
+        if p.is_file() and p.suffix.lower() in PROJ.IMAGE_EXTS
+    )
+    if not all_imgs:
+        st.caption("_(no images)_")
+        return
+
+    thumbs = all_imgs[:4]
+    parts = ['<div style="display:flex;gap:6px;margin:6px 0 6px 0;flex-wrap:wrap;">']
+    for p in thumbs:
+        url = _image_to_data_url(p, max_edge=240)
+        parts.append(
+            f'<img src="{url}" '
+            f'style="width:108px;height:108px;object-fit:cover;border-radius:4px;'
+            f'border:1px solid rgba(255,255,255,0.18);background:#1a1a1a;" '
+            f'title="{p.name}"/>'
+        )
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+    if total_images > 4:
+        zc1, zc2 = st.columns([2, 1])
+        with zc1:
+            st.caption(f"+{total_images - 4} more in this folder")
+        with zc2:
+            if st.button("🔍 View all", key=f"wiz_zoom_{folder_path.name}",
+                         use_container_width=True,
+                         help="Open every image in this folder at full size"):
+                _show_folder_gallery(folder_path)
+
+
+@st.dialog("Folder gallery", width="large")
+def _show_folder_gallery(folder_path: Path):
+    """All images in a folder, shown at a comfortable QC size. Used by the wizard
+    so the user can inspect everything in archive/dense folders before writing a
+    description, without leaving the app."""
+    if not folder_path.exists():
+        st.error(f"Folder gone: {folder_path}")
+        return
+    imgs = sorted(
+        p for p in folder_path.iterdir()
+        if p.is_file() and p.suffix.lower() in PROJ.IMAGE_EXTS
+    )
+    st.markdown(f"**{folder_path.name}** · {len(imgs)} images")
+    if not imgs:
+        st.caption("_(empty)_")
+        return
+    # Render with cached data URLs — fast even on big folders.
+    parts = ['<div style="display:flex;gap:8px;flex-wrap:wrap;">']
+    for p in imgs:
+        url = _image_to_data_url(p, max_edge=380)
+        parts.append(
+            f'<div style="text-align:center;">'
+            f'<img src="{url}" '
+            f'style="width:200px;height:200px;object-fit:cover;border-radius:4px;'
+            f'border:1px solid rgba(255,255,255,0.18);background:#1a1a1a;display:block;" '
+            f'title="{p.name}"/>'
+            f'<div style="font-size:11px;color:#888;margin-top:2px;">{p.name}</div>'
+            f'</div>'
+        )
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+def render_hover_card_html(
+    input_path: str,
+    overlay_path: str | None,
+    height_px: int = 280,
+    max_edge: int = 900,
+) -> str:
+    """One self-contained HTML+JS card.
+    `input_path` is the bottom image (always the 3D render).
+    `overlay_path` is the top image (the variant) — clipped left→right based on mouseX.
+    If overlay_path is None, only the input image is shown.
+    `max_edge` caps the encoded JPEG's long edge — board uses 900, dialog uses 1280.
+    """
+    input_url = _image_to_data_url(Path(input_path), max_edge=max_edge)
+    overlay_url = _image_to_data_url(Path(overlay_path), max_edge=max_edge) if overlay_path else None
+
+    overlay_html = ""
+    if overlay_url:
+        overlay_html = f"""
+        <div class="overlay" id="ov">
+            <img src="{overlay_url}" draggable="false"/>
+        </div>
+        <div class="divider" id="div"></div>
+        """
+
+    return f"""
+    <!doctype html>
+    <html><head>
+    <style>
+      html, body {{ margin:0; padding:0; background:transparent; overflow:hidden; }}
+      .card {{
+        position:relative;
+        width:100%;
+        height:{height_px}px;
+        border-radius:6px;
+        overflow:hidden;
+        background:#1a1a1a;
+        user-select:none;
+      }}
+      .card img {{
+        position:absolute; inset:0;
+        width:100%; height:100%;
+        object-fit:cover;
+        display:block;
+      }}
+      .overlay {{
+        position:absolute; inset:0;
+        clip-path: inset(0 0 0 50%);
+        pointer-events:none;
+      }}
+      .divider {{
+        position:absolute; top:0; bottom:0;
+        left:50%; width:2px;
+        background:rgba(255,255,255,0.85);
+        box-shadow:0 0 4px rgba(0,0,0,0.6);
+        pointer-events:none;
+      }}
+      .hint {{
+        position:absolute; bottom:6px; left:50%;
+        transform:translateX(-50%);
+        font:11px/1 system-ui,Segoe UI,Roboto,sans-serif;
+        color:rgba(255,255,255,0.9);
+        background:rgba(0,0,0,0.45);
+        padding:3px 8px; border-radius:99px;
+        pointer-events:none;
+        opacity:0.85; transition:opacity 200ms ease;
+      }}
+      .card:hover .hint {{ opacity:0; }}
+    </style>
+    </head>
+    <body>
+      <div class="card" id="card">
+        <img class="bg" src="{input_url}" draggable="false"/>
+        {overlay_html}
+      </div>
+      <script>
+        (function() {{
+          const card = document.getElementById('card');
+          const ov = document.getElementById('ov');
+          const dv = document.getElementById('div');
+          if (!ov || !dv) return;  // no overlay → no slider
+          function update(x) {{
+            const r = card.getBoundingClientRect();
+            let pct = ((x - r.left) / r.width) * 100;
+            if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+            ov.style.clipPath = 'inset(0 0 0 ' + pct + '%)';
+            dv.style.left = pct + '%';
+          }}
+          // Update the divider position only while the mouse is actually moving
+          // INSIDE the card. On mouseleave we intentionally do NOTHING — the
+          // divider stays where the user left it, so they can scan to the
+          // controls or another card without losing their comparison position.
+          card.addEventListener('mousemove', e => update(e.clientX));
+        }})();
+      </script>
+    </body></html>
+    """
+
+
+# ═══ State init + sidebar ════════════════════════════════════════════════
+
+def _init_session_state():
+    st.session_state.setdefault("route", "landing")
+    st.session_state.setdefault("pending_regens", {})
+    st.session_state.setdefault("pending_prompts", {})
+    st.session_state.setdefault("pending_grades", {})   # photo_id → Future (async grading)
+    st.session_state.setdefault("manifest", None)
+    st.session_state.setdefault("project", None)
+    st.session_state.setdefault("detail_photo_id", None)
+    # Per-photo board variant index is stored under flat `vidx::<photo_id>` keys
+    # (see _vidx_key / _current_board_variant). No nested dict — Streamlit
+    # tracks mutations more reliably with top-level keys.
+
+
+_init_session_state()
+
+
+def _load_manifest_for_project(project: PROJ.Project) -> M.Manifest:
+    brand = Path(project.brand_root)
+    output = Path(project.output_root)
+    return P.ingest(cfg, brand, output, project=project)
+
+
+def _close_project():
+    """Reset to landing — clear all per-project session state, including the
+    per-photo board variant indices that use the flat `vidx::` keys."""
+    st.session_state["project"] = None
+    st.session_state["manifest"] = None
+    st.session_state["detail_photo_id"] = None
+    st.session_state["pending_regens"] = {}
+    st.session_state["pending_prompts"] = {}
+    st.session_state["pending_grades"] = {}
+    # Drop every per-photo board variant index. Iterate over a list copy so we
+    # can mutate the dict-like during iteration.
+    for k in [k for k in st.session_state.keys() if str(k).startswith("vidx::")]:
+        del st.session_state[k]
+    set_route("landing")
+    st.rerun()
+
+
+def _reap_pending_grades():
+    """Pull completed grade futures off pending_grades, surfacing exceptions to last_error."""
+    pending = st.session_state.get("pending_grades", {})
+    done = [pid for pid, f in pending.items() if f.done()]
+    for pid in done:
+        try:
+            pending[pid].result()
+        except Exception:
+            pass  # error already on photo.last_error via submit_grade's wrapper
+        del pending[pid]
+
+
+def _sb_section(label: str):
+    """Sidebar section header — small uppercase caption."""
+    st.markdown(
+        f"<div style='font-size:11px;font-weight:600;color:var(--text-3);"
+        f"text-transform:uppercase;letter-spacing:0.08em;"
+        f"margin:20px 0 10px 0;'>{label}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_sidebar():
+    """Shared sidebar — visible on board + detail routes.
+
+    Visual rhythm: project identity at the top, then named sections separated by
+    small uppercase headers rather than horizontal rules. Less visual noise."""
+    project: PROJ.Project | None = st.session_state.get("project")
+    manifest: M.Manifest | None = st.session_state.get("manifest")
+
+    with st.sidebar:
+        # ── Identity block
+        if project:
+            brand_name = Path(project.brand_root).name
+            st.markdown(
+                f"<div style='display:flex;align-items:center;gap:10px;'>"
+                f"<div style='font-size:20px;'>📁</div>"
+                f"<div style='min-width:0;flex:1;'>"
+                f"<div style='font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;"
+                f"white-space:nowrap;'>{project.name}</div>"
+                f"<div style='font-size:11px;color:var(--text-3);overflow:hidden;text-overflow:ellipsis;"
+                f"white-space:nowrap;'>{brand_name}</div>"
+                f"</div></div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                if st.button("← Projects", use_container_width=True, key="back_to_landing"):
+                    _close_project()
+            with sc2:
+                if st.button("↻ Rescan", use_container_width=True, key="rescan_folder",
+                             help="Re-scan brand folder for new/changed images"):
+                    st.session_state["manifest"] = _load_manifest_for_project(project)
+                    st.rerun()
+        else:
+            st.markdown(
+                "<div style='font-size:18px;font-weight:600;'>AI Bucherer</div>"
+                "<div style='font-size:11px;color:var(--text-3);'>Auto pipeline</div>",
+                unsafe_allow_html=True,
+            )
+
+        # ── Generation settings
+        _sb_section("Generation")
+        n_variants = st.slider(
+            "Variants per regenerate", 1, cfg.max_n, cfg.default_n,
+            key="n_variants_slider",
+            help=f"Each photo generates this many variants from Nano Banana (default {cfg.default_n}).",
+        )
+
+        # ── View settings (route-specific)
+        if current_route() == "board":
+            _sb_section("Board view")
+            st.session_state.setdefault("board_card_size", "Medium")
+            st.radio(
+                "Card size",
+                ["Small", "Medium", "Large"],
+                index=["Small", "Medium", "Large"].index(st.session_state["board_card_size"]),
+                key="board_card_size",
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+
+        if current_route() == "detail":
+            _sb_section("Detail view")
+            st.session_state.setdefault("detail_view_mode", "Side by side")
+            st.session_state.setdefault("detail_image_size", "Medium")
+            st.radio(
+                "Card layout",
+                ["Side by side", "Input only", "Output only"],
+                index=["Side by side", "Input only", "Output only"].index(st.session_state["detail_view_mode"]),
+                key="detail_view_mode",
+            )
+            st.radio(
+                "Image size",
+                ["Small", "Medium", "Large", "Full"],
+                index=["Small", "Medium", "Large", "Full"].index(st.session_state["detail_image_size"]),
+                key="detail_image_size",
+                horizontal=True,
+            )
+
+        # ── Stats
+        _sb_section("Stats")
+        if manifest:
+            n_photos = len(manifest.photos)
+            n_graded = sum(1 for p in manifest.photos.values() if p.graded)
+            n_ready = sum(1 for p in manifest.photos.values() if p.variants)
+            pct = (n_graded / n_photos * 100) if n_photos else 0
+            st.markdown(
+                f"<div style='display:flex;flex-direction:column;gap:8px;'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:baseline;'>"
+                f"<span style='font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.06em;'>Cost</span>"
+                f"<span style='font-size:20px;font-weight:600;font-variant-numeric:tabular-nums;'>${manifest.total_cost_usd:.2f}</span>"
+                f"</div>"
+                f"<div style='display:flex;justify-content:space-between;align-items:baseline;'>"
+                f"<span style='font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.06em;'>Graded</span>"
+                f"<span style='font-size:14px;font-weight:500;font-variant-numeric:tabular-nums;'>"
+                f"<b>{n_graded}</b><span style='color:var(--text-3);'> / {n_photos}</span></span>"
+                f"</div>"
+                f"<div style='height:4px;background:var(--bg-elev-3);border-radius:2px;overflow:hidden;'>"
+                f"<div style='height:100%;width:{pct:.1f}%;background:var(--accent);transition:width 300ms ease;'></div>"
+                f"</div>"
+                f"<div style='font-size:11px;color:var(--text-3);'>{n_ready} of {n_photos} have variants</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                "<div style='font-size:12px;color:var(--text-3);'>No project open.</div>",
+                unsafe_allow_html=True,
+            )
+
+        # Hero
+        if manifest:
+            st.markdown("---")
+            st.header("Hero (grading reference)")
+            st.caption(
+                "Color reference all graded outputs match against. Without a hero, "
+                "grading only normalizes the background."
+            )
+            hero_upload = st.file_uploader(
+                "Upload hero",
+                type=["png", "jpg", "jpeg", "webp"],
+                key="sidebar_hero_uploader",
+            )
+            if hero_upload is not None and st.button(
+                "📌 Set as hero", key="set_hero_btn", use_container_width=True,
+            ):
+                hero_dir = Path(manifest.output_root) / ".hero"
+                hero_dir.mkdir(parents=True, exist_ok=True)
+                hero_target = hero_dir / hero_upload.name
+                hero_target.write_bytes(hero_upload.getvalue())
+                manifest.hero_path = str(hero_target)
+                manifest.hero_photo_id = None
+                M.save(manifest)
+                st.success(f"Hero set to {hero_upload.name}")
+                st.rerun()
+
+            if manifest.hero_path:
+                hp = Path(manifest.hero_path)
+                if hp.exists():
+                    st.image(str(hp), width=200, caption=f"Hero: {hp.name}")
+                    hc1, hc2 = st.columns(2)
+                    with hc1:
+                        if st.button("Clear", key="clear_hero_btn", use_container_width=True):
+                            manifest.hero_path = None
+                            manifest.hero_photo_id = None
+                            M.save(manifest)
+                            st.rerun()
+                    with hc2:
+                        if st.button("Re-grade all", key="regrade_all_btn", use_container_width=True,
+                                     help="Re-run the harmonizer on every picked variant. Free."):
+                            n = P.regrade_all_selected(cfg, manifest)
+                            st.success(f"Re-graded {n} photo(s).")
+                            st.rerun()
+                else:
+                    st.warning(f"Hero file missing: {hp}")
+            else:
+                st.warning("No hero set — grading is background-only.")
+
+        # Project settings (briefs + per-product hero override)
+        if project:
+            _sb_section("Project settings")
+
+            with st.expander("Product descriptions", expanded=False):
+                st.caption(
+                    "Ground-truth line Claude reads before its brief. Changes "
+                    "apply on next prompt regeneration."
+                )
+                changed = False
+                for pg in project.products:
+                    new_desc = st.text_input(
+                        f"{pg.folder_name} ({'worn' if pg.is_worn else 'packshot'}) · {pg.n_images} img",
+                        value=pg.description,
+                        key=f"proj_desc_{pg.folder_name}",
+                        placeholder='e.g. "a ring in gold and diamonds"',
+                    )
+                    if new_desc != pg.description:
+                        pg.description = new_desc
+                        changed = True
+                if changed:
+                    PROJ.save_project(project)
+                    if manifest:
+                        manifest.product_briefs = project.product_brief_map()
+                        M.save(manifest)
+                    st.toast("Saved.", icon="💾")
+
+            with st.expander("Per-product hero overrides", expanded=False):
+                st.caption(
+                    "Each product can use a different grading reference. If no "
+                    "override is set, the photo grades against the project-wide hero."
+                )
+                if not manifest:
+                    st.markdown("<div class='subtle'>Open a project to manage overrides.</div>",
+                                unsafe_allow_html=True)
+                else:
+                    for pg in project.products:
+                        current_path = manifest.product_heroes.get(pg.folder_name)
+                        current_ok = bool(current_path and Path(current_path).exists())
+                        # Per-product card
+                        st.markdown(
+                            f"<div style='font-size:12px;font-weight:600;color:var(--text);"
+                            f"margin:10px 0 4px 0;'>{pg.folder_name}</div>",
+                            unsafe_allow_html=True,
+                        )
+                        if current_ok:
+                            ph1, ph2 = st.columns([2, 1])
+                            with ph1:
+                                # Thumbnail of the current override
+                                url = _image_to_data_url(Path(current_path), max_edge=160)
+                                st.markdown(
+                                    f"<img src='{url}' style='width:100%;max-width:160px;"
+                                    f"aspect-ratio:1/1;object-fit:cover;border-radius:6px;"
+                                    f"border:1px solid var(--border-subtle);' "
+                                    f"title='{Path(current_path).name}'/>",
+                                    unsafe_allow_html=True,
+                                )
+                            with ph2:
+                                if st.button("Clear", key=f"clearhero_{pg.folder_name}",
+                                             use_container_width=True,
+                                             help="Fall back to the project-wide hero"):
+                                    manifest.product_heroes.pop(pg.folder_name, None)
+                                    M.save(manifest)
+                                    st.rerun()
+                        else:
+                            st.markdown(
+                                "<div class='subtle' style='font-size:11px;margin-bottom:6px;'>"
+                                "Using project default. Upload an override:</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        up = st.file_uploader(
+                            "Upload hero", type=["png", "jpg", "jpeg", "webp"],
+                            key=f"heroup_{pg.folder_name}",
+                            label_visibility="collapsed",
+                        )
+                        if up is not None and st.button(
+                            "Set as override", key=f"setoverhero_{pg.folder_name}",
+                            use_container_width=True,
+                        ):
+                            heroes_dir = Path(manifest.output_root) / ".hero" / pg.folder_name
+                            heroes_dir.mkdir(parents=True, exist_ok=True)
+                            target = heroes_dir / up.name
+                            target.write_bytes(up.getvalue())
+                            manifest.product_heroes[pg.folder_name] = str(target)
+                            M.save(manifest)
+                            st.toast(f"Hero set for {pg.folder_name}", icon="📌")
+                            st.rerun()
+
+        # Keys + model
+        st.markdown("---")
+        st.caption(
+            f"Model: `{cfg.gemini_model}`  ·  {cfg.gemini_aspect_ratio} · {cfg.gemini_image_size}"
+        )
+        a_ok = "✓" if cfg.anthropic_api_key else "✗"
+        g_ok = "✓" if cfg.gemini_api_key else "✗"
+        st.caption(f"ANTHROPIC: {a_ok}    GEMINI: {g_ok}")
+        if not cfg.anthropic_api_key or not cfg.gemini_api_key:
+            st.warning("Missing keys in `_auto_pipeline/.env` — restart app after fixing.")
+
+
+# ═══ Route: LANDING ══════════════════════════════════════════════════════
+
+def render_landing_page():
+    # ── Header strip: tight, brand-forward, no oversized title
+    head_l, head_r = st.columns([5, 2])
+    with head_l:
+        st.markdown(
+            "<div style='display:flex;align-items:baseline;gap:12px;'>"
+            "<span style='font-size:22px;font-weight:600;letter-spacing:-0.01em;'>AI Bucherer</span>"
+            "<span class='subtle' style='font-size:13px;'>Auto pipeline</span>"
+            "</div>"
+            "<div class='subtle' style='font-size:13px;margin-top:4px;'>"
+            "3D render → Claude prompt → Nano Banana variants → graded output"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    with head_r:
+        if st.button("➕  New project", type="primary", use_container_width=True,
+                     key="landing_new_project"):
+            for k in ("wiz_brand", "wiz_output", "wiz_name", "wiz_products"):
+                st.session_state.pop(k, None)
+            set_route("create")
+            st.rerun()
+
+    _missing_briefs = [c for c in ("packshot", "worn") if not cfg.get_brief(c).strip()]
+    if _missing_briefs:
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+        st.error(
+            "Missing brief file(s): "
+            + ", ".join(f"`prompts/brief_{c}.md`" for c in _missing_briefs)
+            + ". Generation is blocked until these exist."
+        )
+
+    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+    st.markdown("#### Projects")
+
+    projects = PROJ.list_projects()
+    if not projects:
+        empty = st.container(border=True)
+        with empty:
+            st.markdown(
+                "<div style='text-align:center;padding:24px 0;'>"
+                "<div style='font-size:32px;margin-bottom:8px;'>📁</div>"
+                "<div style='font-weight:600;margin-bottom:4px;'>No projects yet</div>"
+                "<div class='subtle' style='font-size:13px;'>"
+                "Click <b>New project</b> to point at a brand folder and start.</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        return
+
+    for s in projects:
+        tile = st.container(border=True)
+        with tile:
+            tc1, tc2, tc3 = st.columns([6, 1.4, 0.6])
+            with tc1:
+                brand_name = Path(s.brand_root).name
+                out_name = Path(s.output_root).name
+                updated = s.updated_at[:10] if s.updated_at else "—"
+                st.markdown(
+                    f"<div style='font-size:15px;font-weight:600;margin-bottom:4px;'>{s.name}</div>"
+                    f"<div class='row-wrap' style='font-size:12px;color:var(--text-3);'>"
+                    f"<span class='nowrap'>{brand_name}</span>"
+                    f"<span style='color:var(--text-disabled);'>→</span>"
+                    f"<span class='nowrap'>{out_name}</span>"
+                    f"<span style='color:var(--text-disabled);margin:0 4px;'>·</span>"
+                    f"<span class='nowrap'>{s.n_products} product folders</span>"
+                    f"<span style='color:var(--text-disabled);margin:0 4px;'>·</span>"
+                    f"<span class='nowrap'>updated {updated}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            with tc2:
+                if st.button("Open →", key=f"open_{s.slug}",
+                             type="primary",
+                             use_container_width=True):
+                    proj = PROJ.load_project(s.slug)
+                    if not proj:
+                        st.error("Failed to load project.")
+                    else:
+                        st.session_state["project"] = proj
+                        st.session_state["manifest"] = _load_manifest_for_project(proj)
+                        mf = st.session_state["manifest"]
+                        pending = any(not p.variants for p in mf.photos.values())
+                        set_route("loading" if pending else "board")
+                        st.rerun()
+            with tc3:
+                if st.button("🗑", key=f"del_{s.slug}", use_container_width=True,
+                             help="Delete project metadata (does not touch your images)"):
+                    PROJ.delete_project(s.slug)
+                    st.rerun()
+
+
+# ═══ Route: CREATE (new project wizard) ══════════════════════════════════
+
+def render_create_project_page():
+    st.title("Create new project")
+
+    if st.button("← Cancel", key="create_cancel"):
+        set_route("landing")
+        st.rerun()
+
+    st.markdown("##### 1) Choose folders")
+
+    brand_text = st.text_input(
+        "Brand folder (contains one subfolder per product)",
+        value=st.session_state.get("wiz_brand", ""),
+        placeholder=r"C:\path\to\Bucherer",
+        key="wiz_brand",
+    )
+    brand_path: Path | None = Path(brand_text) if brand_text.strip() else None
+    brand_valid = bool(brand_path and brand_path.exists() and brand_path.is_dir())
+    if brand_text.strip() and not brand_valid:
+        st.warning(f"Folder doesn't exist: {brand_path}")
+
+    default_output = ""
+    if brand_valid:
+        default_output = str(P.default_output_root(cfg, brand_path))
+    output_text = st.text_input(
+        "Output folder",
+        value=st.session_state.get("wiz_output", default_output),
+        placeholder="auto: <brand>_OUT",
+        key="wiz_output",
+    )
+    output_path: Path | None = Path(output_text) if output_text.strip() else None
+
+    name_default = brand_path.name if brand_valid else ""
+    name = st.text_input(
+        "Project name",
+        value=st.session_state.get("wiz_name", name_default),
+        placeholder=name_default or "My project",
+        key="wiz_name",
+    )
+
+    if not brand_valid:
+        st.info("Pick a brand folder to continue.")
+        return
+
+    # Discover products on the fly
+    discovered = PROJ.discover_product_groups(brand_path)
+    if not discovered:
+        st.error(
+            f"No image-containing subfolders found in `{brand_path}`. Expected layout:\n\n"
+            "```\nBrand/\n  01_Product/\n    img1.png\n    img2.png\n  01_worn/\n    ...\n```"
+        )
+        return
+
+    st.markdown(
+        f"##### 2) Describe each product · {len(discovered)} folder(s) found"
+    )
+    st.caption(
+        "These descriptions are passed to Claude as the first line of the system prompt "
+        "(`The image attached is: \"…\"`) so it doesn't make vision mistakes about jewelry type or material."
+    )
+
+    # Preserve any in-progress descriptions across reruns
+    existing_descs = st.session_state.get("wiz_products", {})
+    for pg in discovered:
+        key = f"wiz_desc_{pg.folder_name}"
+        if key not in st.session_state:
+            st.session_state[key] = existing_descs.get(pg.folder_name, "")
+
+    grid_cols = st.columns(2)
+    for i, pg in enumerate(discovered):
+        with grid_cols[i % 2]:
+            box = st.container(border=True)
+            with box:
+                badge = "<span class='badge badge-worn'>worn</span>" if pg.is_worn else "<span class='badge'>packshot</span>"
+                st.markdown(
+                    f"**{pg.folder_name}** · {pg.n_images} img &nbsp; {badge}",
+                    unsafe_allow_html=True,
+                )
+                # Thumbnails so the user can actually see what they're describing.
+                # Uses cached data URLs — instant after first load, free on reruns.
+                _render_wizard_thumb_strip(brand_path / pg.folder_name, pg.n_images)
+                st.text_input(
+                    "Product description",
+                    key=f"wiz_desc_{pg.folder_name}",
+                    placeholder=(
+                        'e.g. "a worn necklace in gold and diamonds, paperclip pendant, taupe V-neck"'
+                        if pg.is_worn
+                        else 'e.g. "a ring in gold and diamonds, three asscher stones"'
+                    ),
+                    label_visibility="collapsed",
+                )
+
+    # Validation
+    missing = [pg.folder_name for pg in discovered
+               if not st.session_state.get(f"wiz_desc_{pg.folder_name}", "").strip()]
+    can_create = bool(name.strip()) and not missing
+
+    st.markdown("---")
+    cc1, cc2 = st.columns([3, 1])
+    with cc1:
+        if missing:
+            st.caption(
+                f"Add a description for: {', '.join(f'`{f}`' for f in missing)}"
+            )
+        else:
+            n_total = sum(pg.n_images for pg in discovered)
+            est_cost = n_total * cfg.default_n * cfg.effective_cost_per_image + n_total * 0.01
+            st.caption(
+                f"Ready. {n_total} image(s) × {cfg.default_n} variants ≈ **${est_cost:.2f}** for the first auto-prepare."
+            )
+    with cc2:
+        if st.button(
+            "Create project + generate", type="primary",
+            disabled=not can_create, use_container_width=True,
+        ):
+            # Build Project
+            out = output_path or P.default_output_root(cfg, brand_path)
+            products = []
+            for pg in discovered:
+                pg.description = st.session_state.get(f"wiz_desc_{pg.folder_name}", "").strip()
+                products.append(pg)
+            proj = PROJ.Project(
+                name=name.strip(),
+                brand_root=str(brand_path),
+                output_root=str(out),
+                products=products,
+            )
+            PROJ.save_project(proj)
+            mf = _load_manifest_for_project(proj)
+
+            st.session_state["project"] = proj
+            st.session_state["manifest"] = mf
+
+            # Submit all pending photos in parallel right away
+            pending = [p for p in mf.photos.values() if not p.variants]
+            pending_dict = st.session_state.setdefault("pending_regens", {})
+            for photo in pending:
+                fut = P.submit_regenerate(
+                    cfg, mf, photo,
+                    get_anthropic_client(), get_gemini_client(),
+                    n=st.session_state.get("n_variants_slider", cfg.default_n),
+                )
+                pending_dict[photo.photo_id] = fut
+
+            set_route("loading")
+            st.rerun()
+
+
+# ═══ Route: LOADING (auto-prepare progress bar) ══════════════════════════
+
+def render_loading_page():
+    project: PROJ.Project | None = st.session_state.get("project")
+    manifest: M.Manifest | None = st.session_state.get("manifest")
+    if not project or not manifest:
+        set_route("landing")
+        st.rerun()
+        return
+
+    st.title(f"Preparing **{project.name}**")
+    st.caption("Generating prompts + variants in parallel. This runs once per project.")
+
+    # Reap any completed futures
+    pending = st.session_state.get("pending_regens", {})
+    done_ids = [pid for pid, f in pending.items() if f.done()]
+    for pid in done_ids:
+        try:
+            pending[pid].result()
+        except Exception:
+            pass
+        del pending[pid]
+
+    # Status counts
+    photos = list(manifest.photos.values())
+    n_total = len(photos)
+    n_done = sum(1 for p in photos if p.variants)
+    n_running = sum(1 for f in pending.values() if not f.done())
+    n_failed = sum(1 for p in photos if p.last_error and not p.variants)
+
+    pct = (n_done / n_total) if n_total else 1.0
+    st.progress(pct, text=f"{n_done} / {n_total} photos ready · {n_running} in flight")
+
+    if n_failed:
+        st.warning(f"{n_failed} photo(s) errored. They'll be shown on the board view so you can retry.")
+        with st.expander("Show errors"):
+            for p in photos:
+                if p.last_error and not p.variants:
+                    st.markdown(f"- **{p.photo_id}** — {p.last_error[:200]}")
+
+    # Done?
+    if n_running == 0 and n_done + n_failed >= n_total:
+        st.success("All set. Loading the board…")
+        set_route("board")
+        st.rerun()
+        return
+
+    # Otherwise keep polling
+    st_autorefresh(interval=1500, key="loading_poll", limit=None)
+    st.caption("⚙ Working in background — feel free to leave this tab; state is saved.")
+
+
+# ═══ Route: BOARD (Pinterest-style grid) ═════════════════════════════════
+
+def _board_cols_for_size(size: str) -> int:
+    """Cards per row for the chosen thumbnail size. Fewer columns → wider (bigger)
+    square thumbnails. Drives both the column layout and the row chunking."""
+    return {"Small": 5, "Medium": 4, "Large": 3}.get(size, 4)
+
+
+def _vidx_key(photo: M.PhotoState) -> str:
+    """Session-state key holding the displayed variant index for a photo on the board.
+    Flat keys (not a nested dict) avoid any Streamlit edge cases around dict-mutation
+    persistence across reruns."""
+    return f"vidx::{photo.photo_id}"
+
+
+def _current_board_variant(photo: M.PhotoState) -> int:
+    """Which variant index is currently displayed for this photo on the board.
+    Reads from a per-photo flat key in st.session_state.
+
+    Falls back to the photo's selected variant (if any) or 0 when no index is
+    stored, or when the stored index is out of range for the current variant list.
+    """
+    key = _vidx_key(photo)
+    if key in st.session_state:
+        idx = st.session_state[key]
+        if isinstance(idx, int) and 0 <= idx < max(len(photo.variants), 1):
+            return idx
+    if photo.selected_variant and photo.selected_variant in photo.variants:
+        idx = photo.variants.index(photo.selected_variant)
+    else:
+        idx = 0
+    st.session_state[key] = idx
+    return idx
+
+
+def _set_board_variant(photo: M.PhotoState, idx: int) -> None:
+    """Write the per-photo displayed variant index. Used by the ◀/▶ click handlers
+    and by _handle_select to keep the board card in sync with the picked variant."""
+    st.session_state[_vidx_key(photo)] = idx
+
+
+# ── Module-level button callbacks ────────────────────────────────────────
+# Defined at module scope (not inside render_board_card) so each st.button's
+# on_click binds to a stable function reference instead of a fresh closure
+# per render. Streamlit captures the callback by reference; closure-based
+# callbacks created on every rerun risk losing their captured variables.
+# We pass photo_id + n_variants via functools.partial to bind them explicitly.
+
+def _cb_variant_step(pid: str, n: int, delta: int) -> None:
+    """Advance (delta=+1) or retreat (delta=-1) the displayed variant for `pid`."""
+    if n <= 0:
+        return
+    key = f"vidx::{pid}"
+    cur = st.session_state.get(key, 0)
+    if not isinstance(cur, int):
+        cur = 0
+    st.session_state[key] = (cur + delta) % n
+
+
+def _cb_open_detail(pid: str) -> None:
+    """Open the detail view for `pid` (route + selection update)."""
+    st.session_state["detail_photo_id"] = pid
+    st.session_state["route"] = "detail"
+
+
+def render_board_card(photo: M.PhotoState):
+    """One card on the board: square thumbnail + variant arrows + open button.
+
+    Layout (top-to-bottom):
+      • Square 1:1 thumbnail of the current variant / graded output
+      • Tight control row (‹  chip  ›  ⤢)  — chip shows "1 / 4" or status
+      • Filename + classification + status badges
+    """
+    n_variants = len(photo.variants)
+    idx = _current_board_variant(photo)
+    overlay_path = photo.variants[idx] if n_variants > 0 else None
+
+    fut = st.session_state.get("pending_regens", {}).get(photo.photo_id)
+    is_regenerating = fut is not None and not fut.done()
+    gfut = st.session_state.get("pending_grades", {}).get(photo.photo_id)
+    is_grading = gfut is not None and not gfut.done()
+
+    # ── 1) The image (top, dominant)
+    # Show the canonical review image: the graded output if saved, otherwise the
+    # currently-selected variant, falling back to the raw input. We deliberately
+    # use a native st.image (not a per-card components.v1.html iframe): rendering
+    # 40+ custom-component iframes on one page wedges the Streamlit session so
+    # that NO widget interaction triggers a rerun — every board button silently
+    # dies. The input-vs-output compare slider lives in the detail view, where a
+    # single component instance is safe. The keyed container lets the CSS below
+    # force a square 1:1 thumbnail.
+    if photo.graded and Path(photo.output_path).exists():
+        display_img = photo.output_path
+    elif overlay_path and Path(overlay_path).exists():
+        display_img = overlay_path
+    else:
+        display_img = photo.input_path
+
+    with st.container(key=f"boardimg-{photo.photo_id}"):
+        st.image(display_img, use_container_width=True)
+
+    # ── 2) Control row — clean toolbar inspired by the Gemini variant card:
+    #     ‹  1 / 4  ›        ⤢
+    # Chevrons + inline count + fullscreen icon. When the photo has no
+    # variants we DROP the arrows entirely (instead of showing disabled
+    # squares) and the chip carries the status message ("pending"/"error"/
+    # "generating"). The button keys include n_variants so Streamlit
+    # discards the stale widget state when the variant count changes —
+    # without this, a button rendered initially disabled stays effectively
+    # disabled even after variants arrive.
+    has_nav = n_variants > 1
+    is_picked = bool(photo.selected_variant and photo.selected_variant == overlay_path)
+
+    if is_grading:
+        chip_inner = "<span style='font-weight:600;'>● grading</span>"
+        chip_class = "var-chip var-chip-running"
+    elif is_regenerating:
+        chip_inner = "<span style='font-weight:600;'>● generating</span>"
+        chip_class = "var-chip var-chip-running"
+    elif n_variants:
+        mark = " · saved" if is_picked and photo.graded else ""
+        chip_inner = f"<b style='font-variant-numeric:tabular-nums;'>{idx + 1}</b>"\
+                     f"<span style='color:var(--text-3);margin:0 4px;'>/</span>"\
+                     f"<span style='font-variant-numeric:tabular-nums;'>{n_variants}</span>"\
+                     f"{mark}"
+        chip_class = "var-chip var-chip-picked" if is_picked else "var-chip"
+    elif photo.last_error:
+        chip_inner = "error"
+        chip_class = "var-chip var-chip-empty"
+    else:
+        chip_inner = "pending"
+        chip_class = "var-chip var-chip-empty"
+
+    # Wrap the toolbar in a keyed container so the .st-key-boardctrls CSS above
+    # can actually reach the buttons (see the CSS comment for why a markdown div
+    # can't). Layout: [‹] [chip] [›]  ······  [⤢]; arrows drop when has_nav is False.
+    with st.container(key=f"boardctrls-{photo.photo_id}"):
+        if has_nav:
+            cPrev, cChip, cNext, cSpacer, cOpen = st.columns([1, 3, 1, 0.5, 1])
+        else:
+            # Arrows hidden; chip takes the space.
+            cPrev = cNext = None
+            cChip, cSpacer, cOpen = st.columns([5, 0.5, 1])
+
+        # State changes go through on_click callbacks, which run before the rerun —
+        # the button's return value is intentionally ignored.
+        if has_nav and cPrev is not None:
+            with cPrev:
+                st.button(
+                    "‹", key=f"prev_{photo.photo_id}_{n_variants}",
+                    use_container_width=True,
+                    help="Previous variant",
+                    on_click=_cb_variant_step,
+                    args=(photo.photo_id, n_variants, -1),
+                )
+        with cChip:
+            st.markdown(
+                f"<div style='display:flex;justify-content:center;align-items:center;"
+                f"height:30px;'><div class='{chip_class}'>{chip_inner}</div></div>",
+                unsafe_allow_html=True,
+            )
+        if has_nav and cNext is not None:
+            with cNext:
+                st.button(
+                    "›", key=f"next_{photo.photo_id}_{n_variants}",
+                    use_container_width=True,
+                    help="Next variant",
+                    on_click=_cb_variant_step,
+                    args=(photo.photo_id, n_variants, +1),
+                )
+        with cOpen:
+            st.button(
+                "⤢", key=f"open_{photo.photo_id}",
+                use_container_width=True,
+                help="Open detail view",
+                on_click=_cb_open_detail,
+                args=(photo.photo_id,),
+            )
+
+    # ── 3) Filename + badges (compact footer)
+    cls = photo.classification or "packshot"
+    cls_class = "badge-worn" if cls == "worn" else "badge-packshot"
+    badges_html = f"<span class='badge {cls_class}'>{cls}</span>"
+    if photo.graded:
+        badges_html += "<span class='badge badge-ready'>saved</span>"
+    elif photo.last_error and not photo.variants:
+        # Hover shows the full error via title attribute
+        err_short = (photo.last_error or "").replace('"', "'")[:120]
+        badges_html += f"<span class='badge badge-error' title=\"{err_short}\">error</span>"
+
+    fname = Path(photo.input_path).name
+    st.markdown(
+        f"<div style='display:flex;justify-content:space-between;align-items:center;"
+        f"gap:8px;margin-top:6px;font-size:11px;'>"
+        f"<span class='subtle' style='overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+        f"min-width:0;flex:1;' title='{fname}'>{fname}</span>"
+        f"<span class='row' style='flex-shrink:0;'>{badges_html}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_board_page():
+    project: PROJ.Project | None = st.session_state.get("project")
+    manifest: M.Manifest | None = st.session_state.get("manifest")
+    if not project or not manifest:
+        set_route("landing")
+        st.rerun()
+        return
+
+    # Reap completed futures so newly-finished photos show their variants/output
+    pending = st.session_state.get("pending_regens", {})
+    done = [pid for pid, f in pending.items() if f.done()]
+    for pid in done:
+        try:
+            pending[pid].result()
+        except Exception:
+            pass
+        del pending[pid]
+    pending_p = st.session_state.get("pending_prompts", {})
+    done = [pid for pid, f in pending_p.items() if f.done()]
+    for pid in done:
+        try:
+            pending_p[pid].result()
+        except Exception:
+            pass
+        del pending_p[pid]
+    _reap_pending_grades()
+
+    # ── Header: project + key stats + primary action
+    n_total = len(manifest.photos)
+    n_ready = sum(1 for p in manifest.photos.values() if p.variants)
+    n_graded = sum(1 for p in manifest.photos.values() if p.graded)
+    pending_count = sum(1 for p in manifest.photos.values() if not p.variants)
+
+    h1, h2 = st.columns([5, 2])
+    with h1:
+        st.markdown(
+            f"<div style='font-size:22px;font-weight:600;letter-spacing:-0.01em;'>{project.name}</div>"
+            f"<div class='row-wrap' style='margin-top:6px;font-size:12px;color:var(--text-3);'>"
+            f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>{n_total}</b> photos</span>"
+            f"<span style='color:var(--text-disabled);margin:0 2px;'>·</span>"
+            f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>{n_ready}</b> with variants</span>"
+            f"<span style='color:var(--text-disabled);margin:0 2px;'>·</span>"
+            f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>{n_graded}</b> graded</span>"
+            f"<span style='color:var(--text-disabled);margin:0 2px;'>·</span>"
+            f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>${manifest.total_cost_usd:.2f}</b> spent</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with h2:
+        if pending_count:
+            label = f"▶  Auto-prepare {pending_count} pending"
+            if st.button(label, type="primary", use_container_width=True,
+                         help=f"Generate prompts + {st.session_state.get('n_variants_slider', cfg.default_n)} variants "
+                              f"per photo for the {pending_count} photo(s) not yet processed."):
+                for photo in manifest.photos.values():
+                    if photo.variants:
+                        continue
+                    existing = pending.get(photo.photo_id)
+                    if existing is not None and not existing.done():
+                        continue
+                    fut = P.submit_regenerate(
+                        cfg, manifest, photo,
+                        get_anthropic_client(), get_gemini_client(),
+                        n=st.session_state.get("n_variants_slider", cfg.default_n),
+                    )
+                    pending[photo.photo_id] = fut
+                st.rerun()
+        else:
+            st.markdown(
+                "<div style='display:flex;justify-content:flex-end;align-items:center;"
+                "height:34px;font-size:13px;color:var(--success);'>"
+                "✓ All photos prepared</div>",
+                unsafe_allow_html=True,
+            )
+
+    # Subtle hint about navigation (shown once at the top, not per card)
+    st.markdown(
+        "<div style='font-size:12px;color:var(--text-3);margin-top:4px;"
+        "padding:6px 10px;background:var(--bg-elev-1);border-radius:6px;"
+        "border:1px solid var(--border-subtle);display:inline-block;'>"
+        "💡 Use <b>‹ ›</b> to flip through variants. "
+        "Click <b>⤢</b> to open the full detail view and compare input vs output."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Group photos by product folder (preserve project order)
+    products: dict[str, list[M.PhotoState]] = {}
+    for photo in manifest.photos.values():
+        products.setdefault(photo.product, []).append(photo)
+    # Order by project's product order, then alphabetical for any extras
+    ordered_keys: list[str] = []
+    if project.products:
+        for pg in project.products:
+            if pg.folder_name in products:
+                ordered_keys.append(pg.folder_name)
+    for k in sorted(products.keys()):
+        if k not in ordered_keys:
+            ordered_keys.append(k)
+
+    card_size = st.session_state.get("board_card_size", "Medium")
+    cols_per_row = _board_cols_for_size(card_size)
+
+    for product_name in ordered_keys:
+        photos = products[product_name]
+        # Stable sort by filename within the product
+        photos = sorted(photos, key=lambda p: Path(p.input_path).name.lower())
+        pg = project.find_product(product_name) if project else None
+        is_worn = (pg.is_worn if pg else (photos[0].classification == "worn" if photos else False))
+        n_total_p = len(photos)
+        n_ready_p = sum(1 for p in photos if p.variants)
+        n_graded_p = sum(1 for p in photos if p.graded)
+
+        cls_class = "badge-worn" if is_worn else "badge-packshot"
+        # Per-product hero override flag (small indicator → product uses its own hero, not project default)
+        has_override = bool(manifest.product_heroes.get(product_name)
+                            and Path(manifest.product_heroes[product_name]).exists())
+        hero_badge = (
+            "<span class='badge' style='background:var(--accent-muted);color:var(--accent);"
+            "border-color:rgba(212,168,87,0.28);' "
+            "title='This product uses its own grading hero (overrides the project default)'>"
+            "★ own hero</span>"
+            if has_override else ""
+        )
+        # One coherent header with the badge + readable stats + description
+        st.markdown(
+            f"<div style='margin-top:32px;margin-bottom:10px;'>"
+            f"<div class='row-wrap' style='margin-bottom:4px;'>"
+            f"<span style='font-size:17px;font-weight:600;'>{product_name}</span>"
+            f"<span class='badge {cls_class}'>{'worn' if is_worn else 'packshot'}</span>"
+            f"{hero_badge}"
+            f"<span class='subtle' style='font-size:12px;font-variant-numeric:tabular-nums;'>"
+            f"{n_graded_p} graded · {n_ready_p}/{n_total_p} prepared"
+            f"</span>"
+            f"</div>"
+            + (f"<div class='subtle' style='font-size:13px;font-style:italic;'>"
+               f"{pg.description}</div>" if pg and pg.description else "")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Always allocate a full row of slots so card widths stay consistent
+        # across rows; trailing empties stay invisible (cleaner than st.empty(),
+        # which reserves the slot but yields a forlorn narrow card on partial rows).
+        for row_start in range(0, len(photos), cols_per_row):
+            row_photos = photos[row_start:row_start + cols_per_row]
+            cols = st.columns(cols_per_row, gap="small")
+            for i, photo in enumerate(row_photos):
+                with cols[i]:
+                    render_board_card(photo)
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+    # ── Autorefresh while any background work is running (regen, prompt, grade)
+    # The 1.5s tick is fine when the user is passive; while they're INTERACTING
+    # with buttons it can race the click handler. We slow the tick down to 3s
+    # which is the longest the user reasonably waits to see new variants
+    # appear, while leaving enough headroom that any synchronous handler
+    # (◀/▶/⤢/Pick) lands cleanly between ticks.
+    pending_g = st.session_state.get("pending_grades", {})
+    n_pending = sum(1 for f in pending.values() if not f.done())
+    n_pending += sum(1 for f in pending_p.values() if not f.done())
+    n_pending += sum(1 for f in pending_g.values() if not f.done())
+    if n_pending:
+        st_autorefresh(interval=3000, key="board_poll", limit=None)
+        st.caption(f"⚙ {n_pending} background task(s) running…")
+
+
+# ═══ Route: DETAIL (per-photo card; click-from-board) ════════════════════
+
+def render_photo_card(photo: M.PhotoState):
+    """The full per-image lifecycle UI — moved behind a click on the board."""
+    _sync_card_widgets_if_stale(photo)
+
+    manifest: M.Manifest = st.session_state["manifest"]
+    pending = st.session_state.get("pending_regens", {})
+    fut = pending.get(photo.photo_id)
+    if fut is not None and fut.done():
+        try:
+            fut.result()
+        except Exception:
+            pass
+        del pending[photo.photo_id]
+        _sync_card_widgets_if_stale(photo)
+    is_regenerating = (fut is not None) and not fut.done()
+
+    prompt_pending = st.session_state.get("pending_prompts", {})
+    pfut = prompt_pending.get(photo.photo_id)
+    if pfut is not None and pfut.done():
+        try:
+            pfut.result()
+        except Exception:
+            pass
+        del prompt_pending[photo.photo_id]
+        _sync_card_widgets_if_stale(photo)
+    is_generating_prompt = (pfut is not None) and not pfut.done()
+
+    # Grading futures — same reap pattern so the "Saved" badge appears as soon as the
+    # background grade completes, without freezing the UI thread during the grade itself.
+    grade_pending = st.session_state.get("pending_grades", {})
+    gfut = grade_pending.get(photo.photo_id)
+    if gfut is not None and gfut.done():
+        try:
+            gfut.result()
+        except Exception:
+            pass
+        del grade_pending[photo.photo_id]
+    is_grading = (gfut is not None) and not gfut.done()
+
+    output_root = Path(manifest.output_root)
+    stem = Path(photo.input_path).stem
+
+    view_mode = st.session_state.get("detail_view_mode", "Side by side")
+    image_size = st.session_state.get("detail_image_size", "Medium")
+    n_variants = st.session_state.get("n_variants_slider", cfg.default_n)
+
+    container = st.container(border=True)
+    with container:
+        # Header
+        h1, h2, h3, h4 = st.columns([4, 2, 2, 2])
+        with h1:
+            st.markdown(f"**{Path(photo.input_path).name}**")
+            st.caption(f"`{photo.product}` · ${photo.cost_usd:.3f} spent")
+        with h2:
+            current_class = photo.classification or "packshot"
+            new_class = st.selectbox(
+                "Classification",
+                ["packshot", "worn"],
+                index=0 if current_class == "packshot" else 1,
+                key=f"class_{photo.photo_id}",
+                label_visibility="collapsed",
+            )
+            if new_class != current_class:
+                photo.classification = new_class
+                photo.user_overrode_classification = True
+                M.save(manifest)
+        with h3:
+            if is_grading:
+                st.markdown("<span class='badge badge-running'>● Grading…</span>", unsafe_allow_html=True)
+            elif is_regenerating:
+                st.markdown("<span class='badge badge-running'>● Regenerating…</span>", unsafe_allow_html=True)
+            elif is_generating_prompt:
+                st.markdown("<span class='badge badge-running'>● Generating prompt…</span>", unsafe_allow_html=True)
+            elif photo.graded:
+                st.markdown("<span class='badge badge-ready'>✓ Saved</span>", unsafe_allow_html=True)
+            elif photo.variants:
+                st.markdown("<span class='badge'>● Pick one</span>", unsafe_allow_html=True)
+            elif photo.prompt:
+                st.markdown("<span class='badge'>● Prompt ready</span>", unsafe_allow_html=True)
+            else:
+                st.markdown("<span class='badge'>○ Pending</span>", unsafe_allow_html=True)
+        with h4:
+            if st.button("⟳ Regenerate", key=f"regen_top_{photo.photo_id}",
+                         disabled=(not cfg.gemini_api_key) or is_regenerating,
+                         use_container_width=True,
+                         help="Already regenerating…" if is_regenerating else "Regenerate variants"):
+                _handle_regenerate(photo, n_variants=n_variants)
+
+        if photo.last_error:
+            st.markdown(
+                f"<span class='badge badge-error'>Error: {photo.last_error[:200]}</span>",
+                unsafe_allow_html=True,
+            )
+
+        # Brief notes
+        notes_key = f"notes_{photo.photo_id}"
+        new_notes = st.text_input(
+            "Brief notes (per-photo override; product description from project is used otherwise)",
+            value=photo.brief_notes or "",
+            key=notes_key,
+            placeholder=(
+                "e.g. 'Skyline ring — three asscher diamonds, central larger'"
+                if photo.classification != "worn"
+                else "e.g. 'Necklace worn — paperclip pendant, hand at throat, taupe V-neck'"
+            ),
+        )
+        if new_notes != (photo.brief_notes or ""):
+            photo.brief_notes = new_notes
+            M.save(manifest)
+
+        thumb_input = {"Small": 180, "Medium": 260, "Large": 360, "Full": 460}[image_size]
+        thumb_variant = {"Small": 140, "Medium": 180, "Large": 240, "Full": 320}[image_size]
+        thumb_compare = {"Small": 280, "Medium": 380, "Large": 520, "Full": 680}[image_size]
+
+        if view_mode == "Input only":
+            thumb(photo.input_path, width=thumb_compare, caption="Input",
+                  fs_key=f"fs_input_only_{photo.photo_id}",
+                  fs_caption=f"Input · {Path(photo.input_path).name}")
+        elif view_mode == "Output only":
+            if photo.graded and Path(photo.output_path).exists():
+                thumb(photo.output_path, width=thumb_compare, caption="Output (graded)",
+                      fs_key=f"fs_output_only_{photo.photo_id}",
+                      fs_caption=f"Output · {Path(photo.output_path).name}")
+            else:
+                st.caption("_(no output saved yet)_")
+        else:
+            input_col, variants_col = st.columns([1, 4])
+            with input_col:
+                st.caption("**Input (3D render)**")
+                thumb(photo.input_path, width=thumb_input,
+                      fs_key=f"fs_input_{photo.photo_id}",
+                      fs_caption=f"Input · {Path(photo.input_path).name}")
+            with variants_col:
+                if photo.variants:
+                    st.caption(f"**Variants ({len(photo.variants)})** — click **Pick** to grade + save")
+                    n_cols = min(len(photo.variants), 4)
+                    grid = st.columns(n_cols)
+                    for i, vp in enumerate(photo.variants):
+                        with grid[i % n_cols]:
+                            is_selected = vp == photo.selected_variant
+                            cap = f"v{i + 1} ✓" if is_selected else f"v{i + 1}"
+                            thumb(vp, width=thumb_variant, caption=cap,
+                                  fs_key=f"fs_var_{photo.photo_id}_{i}",
+                                  fs_caption=f"Variant v{i + 1} · {Path(vp).name}")
+                            if st.button("🆚 Compare", key=f"cmp_{photo.photo_id}_{i}",
+                                         use_container_width=True,
+                                         help="Slide between input render and this variant"):
+                                _show_comparison(
+                                    before_path=photo.input_path,
+                                    after_path=vp,
+                                    before_label="Input (3D render)",
+                                    after_label=f"Variant v{i + 1}",
+                                    title=f"v{i + 1} · {Path(vp).name}",
+                                )
+                            if is_grading:
+                                label = "● Grading…"
+                            elif is_selected:
+                                label = "✓ Picked"
+                            else:
+                                label = "Pick"
+                            if st.button(label, key=f"pick_{photo.photo_id}_{i}",
+                                         disabled=is_selected or is_grading,
+                                         use_container_width=True):
+                                _handle_select(photo, vp)
+                else:
+                    st.caption("_(no variants yet — click Regenerate)_")
+
+            if (
+                view_mode == "Side by side"
+                and photo.selected_variant
+                and photo.graded
+                and Path(photo.output_path).exists()
+            ):
+                st.markdown("##### Grading: variant → harmonizer output")
+                g1, g2 = st.columns(2)
+                with g1:
+                    thumb(photo.selected_variant, width=thumb_compare,
+                          caption="Selected variant (raw from Nano Banana)",
+                          fs_key=f"fs_sel_{photo.photo_id}",
+                          fs_caption=f"Selected variant · {Path(photo.selected_variant).name}")
+                with g2:
+                    thumb(photo.output_path, width=thumb_compare,
+                          caption="Graded (saved to output folder)",
+                          fs_key=f"fs_graded_{photo.photo_id}",
+                          fs_caption=f"Graded output · {Path(photo.output_path).name}")
+                    if st.button("🆚 Slide: raw → graded", key=f"cmp_grading_{photo.photo_id}",
+                                 use_container_width=True):
+                        _show_comparison(
+                            before_path=photo.selected_variant,
+                            after_path=photo.output_path,
+                            before_label="Raw variant",
+                            after_label="Graded",
+                            title=f"Grading effect on {Path(photo.output_path).name}",
+                        )
+                    is_current_hero = manifest.hero_photo_id == photo.photo_id
+                    if st.button(
+                        "📌 Currently the hero" if is_current_hero else "📌 Use as hero",
+                        key=f"sethero_{photo.photo_id}",
+                        disabled=is_current_hero, use_container_width=True,
+                    ):
+                        hero_dir = Path(manifest.output_root) / ".hero"
+                        hero_dir.mkdir(parents=True, exist_ok=True)
+                        hero_target = hero_dir / Path(photo.output_path).name
+                        hero_target.write_bytes(Path(photo.output_path).read_bytes())
+                        manifest.hero_path = str(hero_target)
+                        manifest.hero_photo_id = photo.photo_id
+                        M.save(manifest)
+                        st.success(f"Hero set to {hero_target.name}")
+                        st.rerun()
+
+        # Prompt
+        st.markdown("##### Prompt sent to Nano Banana")
+        new_prompt = st.text_area(
+            "prompt",
+            value=photo.prompt or "",
+            height=220,
+            key=f"prompt_{photo.photo_id}",
+            label_visibility="collapsed",
+            placeholder="(empty — click Generate prompt below)",
+        )
+        if new_prompt != (photo.prompt or ""):
+            photo.prompt = new_prompt
+            M.save(manifest)
+        if photo.prompt:
+            _render_prompt_compliance(photo)
+
+        # Actions
+        a1, a2, a3 = st.columns([1, 1, 2])
+        with a1:
+            if st.button("🧠 (Re)generate prompt", key=f"genprompt_{photo.photo_id}",
+                         disabled=(not cfg.anthropic_api_key) or is_generating_prompt,
+                         use_container_width=True):
+                try:
+                    pending_p = st.session_state.setdefault("pending_prompts", {})
+                    existing = pending_p.get(photo.photo_id)
+                    if existing is not None and not existing.done():
+                        st.toast(f"Prompt already generating for {photo.photo_id}.", icon="⏳")
+                    else:
+                        pfut = P.submit_generate_prompt(cfg, manifest, photo, get_anthropic_client())
+                        pending_p[photo.photo_id] = pfut
+                        st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+        with a2:
+            if st.button("⟳ Regenerate variants", key=f"regen_{photo.photo_id}",
+                         disabled=(not cfg.gemini_api_key) or (not photo.prompt) or is_regenerating,
+                         use_container_width=True):
+                _handle_regenerate(photo, n_variants=n_variants)
+        with a3:
+            with st.expander("⤓ Swap reference image", expanded=False):
+                ref_upload = st.file_uploader(
+                    "Upload a different reference image",
+                    type=["png", "jpg", "jpeg", "webp"],
+                    key=f"swapref_{photo.photo_id}",
+                )
+                if ref_upload and st.button("Apply + regenerate",
+                                            key=f"applyref_{photo.photo_id}",
+                                            use_container_width=True):
+                    tmp_dir = output_root / ".swap_refs" / photo.product / stem
+                    tmp_dir.mkdir(parents=True, exist_ok=True)
+                    tmp_path = tmp_dir / ref_upload.name
+                    tmp_path.write_bytes(ref_upload.getvalue())
+                    _handle_regenerate(photo, reference_override=tmp_path, n_variants=n_variants)
+
+
+def _handle_regenerate(
+    photo: M.PhotoState,
+    reference_override: Path | None = None,
+    n_variants: int | None = None,
+):
+    manifest: M.Manifest = st.session_state["manifest"]
+    try:
+        pending = st.session_state.setdefault("pending_regens", {})
+        existing = pending.get(photo.photo_id)
+        if existing is not None and not existing.done():
+            st.toast(f"Already regenerating {photo.photo_id}.", icon="⏳")
+            return
+        fut = P.submit_regenerate(
+            cfg, manifest, photo,
+            get_anthropic_client(), get_gemini_client(),
+            reference_override=reference_override,
+            n=n_variants or st.session_state.get("n_variants_slider", cfg.default_n),
+        )
+        pending[photo.photo_id] = fut
+        st.rerun()
+    except Exception as e:
+        st.error(f"Regenerate failed: {e}")
+
+
+def _handle_select(photo: M.PhotoState, variant_path: str):
+    """Enqueue a grade in the background pool. UI returns immediately; badge shows
+    progress; autorefresh reaps the future and updates the board card to show the
+    graded output."""
+    manifest: M.Manifest = st.session_state["manifest"]
+    pending = st.session_state.setdefault("pending_grades", {})
+    existing = pending.get(photo.photo_id)
+    if existing is not None and not existing.done():
+        st.toast(f"Already grading {photo.photo_id}…", icon="⏳")
+        return
+    try:
+        fut = P.submit_grade(cfg, manifest, photo, variant_path)
+        pending[photo.photo_id] = fut
+        # Optimistically update the board's displayed variant to track the user's pick
+        if variant_path in photo.variants:
+            _set_board_variant(photo, photo.variants.index(variant_path))
+        st.rerun()
+    except Exception as e:
+        st.error(f"Grading failed to start: {e}")
+
+
+def render_detail_page():
+    project: PROJ.Project | None = st.session_state.get("project")
+    manifest: M.Manifest | None = st.session_state.get("manifest")
+    photo_id: str | None = st.session_state.get("detail_photo_id")
+    if not project or not manifest or not photo_id or photo_id not in manifest.photos:
+        set_route("board")
+        st.rerun()
+        return
+    photo = manifest.photos[photo_id]
+
+    nav_l, nav_t, nav_r = st.columns([1, 6, 1])
+    with nav_l:
+        if st.button("◀ Board", use_container_width=True, key="back_to_board"):
+            set_route("board")
+            st.rerun()
+    with nav_t:
+        st.markdown(f"### {photo_id}")
+    with nav_r:
+        # Prev/next within the same product folder
+        same_product = [p for p in manifest.photos.values() if p.product == photo.product]
+        same_product.sort(key=lambda p: Path(p.input_path).name.lower())
+        cur_idx = next((i for i, p in enumerate(same_product) if p.photo_id == photo.photo_id), 0)
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("‹ prev", use_container_width=True,
+                         disabled=(cur_idx == 0), key="detail_prev"):
+                st.session_state["detail_photo_id"] = same_product[cur_idx - 1].photo_id
+                st.rerun()
+        with c2:
+            if st.button("next ›", use_container_width=True,
+                         disabled=(cur_idx >= len(same_product) - 1), key="detail_next"):
+                st.session_state["detail_photo_id"] = same_product[cur_idx + 1].photo_id
+                st.rerun()
+
+    render_photo_card(photo)
+
+    # Refresh ticker while pending work runs (regen / prompt / grade)
+    _pending = st.session_state.get("pending_regens", {})
+    _pending_p = st.session_state.get("pending_prompts", {})
+    _pending_g = st.session_state.get("pending_grades", {})
+    if (
+        any(not f.done() for f in _pending.values())
+        or any(not f.done() for f in _pending_p.values())
+        or any(not f.done() for f in _pending_g.values())
+    ):
+        st_autorefresh(interval=1500, key="detail_poll", limit=None)
+
+
+# ═══ Main dispatch ═══════════════════════════════════════════════════════
+
+route = current_route()
+
+if route in ("board", "detail"):
+    render_sidebar()
+
+if route == "landing":
+    render_landing_page()
+elif route == "create":
+    render_create_project_page()
+elif route == "loading":
+    render_loading_page()
+elif route == "board":
+    render_board_page()
+elif route == "detail":
+    render_detail_page()
+else:
+    set_route("landing")
+    st.rerun()

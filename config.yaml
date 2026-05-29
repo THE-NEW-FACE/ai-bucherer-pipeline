@@ -1,0 +1,30 @@
+# Auto Pipeline defaults. Edit freely; reload by restarting the app.
+
+variants:
+  default_n: 4          # number of variants per regenerate
+  max_n: 10
+
+models:
+  anthropic: claude-sonnet-4-5
+  gemini: gemini-3-pro-image-preview      # Nano Banana Pro, best available (Nov 2025+)
+
+gemini:
+  aspect_ratio: "1:1"                     # 1:1 | 2:3 | 3:2 | 3:4 | 4:3 | 4:5 | 5:4 | 9:16 | 16:9 | 21:9
+  image_size: "2K"                        # 1K | 2K | 4K  (1K and 2K cost the same, 4K is ~2× more)
+  rpm_cap: 200                            # below tier-1 ceiling of 300
+  cost_per_image: 0.05                    # USD, rough estimate at 2K — adjust after observing real costs
+  batch_tier: false                       # true → 50% off, slower turnaround
+  max_retries: 3
+  timeout_s: 90
+
+anthropic:
+  classify_max_tokens: 16
+  prompt_max_tokens: 8000          # 3-part output (Analysis + ~1000-word Re-photograph + Iteration tips) needs ~2500-3000; 8K = 3x headroom
+  cost_input_per_mtok: 3.0   # claude-sonnet-4.5 input
+  cost_output_per_mtok: 15.0 # claude-sonnet-4.5 output
+  cost_cache_read_per_mtok: 0.3
+
+output:
+  suffix: "_OUT"        # input "Bucherer" → output "Bucherer_OUT"
+  format: PNG           # PNG | JPEG | WEBP
+  jpeg_quality: 95

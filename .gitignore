@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+.streamlit/secrets.toml
+
+# Local machine state (absolute Windows paths, per-checkout project defs)
+projects/
+.pipeline_manifest.json
+
+# Scratch / diagnostics (local debugging only)
+_diag_*
+_smoke_imports.py
+
+# Generated output
+runs/
+*_OUT/
+.workspace/
+
+# Python
+*.pyc
+__pycache__/
+*.egg-info/

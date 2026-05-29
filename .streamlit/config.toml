@@ -1,0 +1,28 @@
+# Streamlit runtime configuration for the AI Bucherer auto-pipeline.
+# Dark theme tuned for jewelry studio work — neutral charcoal backgrounds, warm gold
+# accent for primary actions, restrained chrome so the imagery stays the focus.
+
+[theme]
+base = "dark"
+# Warm muted gold — primary action accent (Bucherer brand-adjacent)
+primaryColor = "#D4A857"
+# Page background — true charcoal, sits closer to product-photography reference than pure black
+backgroundColor = "#0E0E10"
+# Cards / sidebar / inputs — one notch lighter so layout reads as depth, not noise
+secondaryBackgroundColor = "#16161A"
+# Body text — off-white for comfortable reading on charcoal (true #fff vibrates on dark)
+textColor = "#E8E8EA"
+# Typography: load Inter for the UI, JetBrains Mono for code blocks (both web-safe via system stack fallback)
+font = "sans serif"
+
+[server]
+headless = true
+runOnSave = true
+fileWatcherType = "auto"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true
