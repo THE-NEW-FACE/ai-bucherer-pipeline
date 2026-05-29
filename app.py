@@ -1409,54 +1409,51 @@ def render_landing_page():
 # ═══ Route: CREATE (new project wizard) ══════════════════════════════════
 
 def _brand_folder_picker(is_dropbox: bool) -> str:
-    """Click-through folder browser. Returns the currently-selected folder path.
+    """File-explorer-style folder browser. Returns the currently-open folder path.
 
-    Navigation lives in session_state['wiz_browse']. A collapsed expander offers a
-    manual path entry for power users; when filled it overrides the browser.
+    One click on a folder row enters it. Root/Up buttons navigate outward. The
+    current folder is the selection — product cards appear below as soon as it
+    contains product image-subfolders. A manual-path expander is the fallback.
     """
     root = "/" if is_dropbox else str(Path.home())
     cur = st.session_state.get("wiz_browse") or root
     try:
-        ok = ST.is_dir(cur)
+        if not ST.is_dir(cur):
+            cur = root
     except Exception:
-        ok = False
-    if not ok:
         cur = root
-        st.session_state["wiz_browse"] = cur
+    st.session_state["wiz_browse"] = cur
 
-    st.caption("Navigate to the folder that contains one subfolder per product.")
-
-    # Breadcrumb (read-only) + up one level
-    bc1, bc2 = st.columns([5, 1])
-    with bc1:
-        st.text_input(
-            "Current folder", value=cur, disabled=True,
-            key="wiz_browse_crumb", label_visibility="collapsed",
-        )
-    with bc2:
+    # Toolbar: Root / Up / current path
+    t1, t2, t3 = st.columns([1, 1, 5])
+    with t1:
+        if st.button("🏠 Root", use_container_width=True, key="nav_root",
+                     disabled=(cur == root)):
+            st.session_state["wiz_browse"] = root
+            st.rerun()
+    with t2:
         at_root = (cur == root) or (ST.parent(cur) == cur)
-        if st.button("⬆ Up", disabled=at_root, use_container_width=True, key="wiz_up"):
+        if st.button("⬆ Up", use_container_width=True, key="nav_up", disabled=at_root):
             st.session_state["wiz_browse"] = ST.parent(cur)
             st.rerun()
+    with t3:
+        st.markdown(
+            f"<div class='subtle' style='padding-top:8px;'>📂 <code>{cur}</code></div>",
+            unsafe_allow_html=True,
+        )
 
-    # Descend into a subfolder
-    names = [ST.name(s) for s in ST.list_subdirs(cur)]
-    if names:
-        oc1, oc2 = st.columns([5, 1])
-        with oc1:
-            target = st.selectbox(
-                "Open subfolder", ["—"] + names,
-                key="wiz_descend", label_visibility="collapsed",
-            )
-        with oc2:
-            if st.button("Open ▸", disabled=(target == "—"),
-                         use_container_width=True, key="wiz_open"):
-                st.session_state["wiz_browse"] = ST.join(cur, target)
+    # Scrollable folder pane — one click enters a folder
+    subdirs = ST.list_subdirs(cur)
+    pane = st.container(height=300, border=True)
+    with pane:
+        if not subdirs:
+            st.caption("No subfolders here. Use ⬆ Up, or pick this folder if your products are inside it.")
+        for s in subdirs:
+            if st.button(f"📁 {ST.name(s)}", key=f"nav::{s}", use_container_width=True):
+                st.session_state["wiz_browse"] = s
                 st.rerun()
-    else:
-        st.caption("No subfolders inside this folder.")
 
-    with st.expander("Or paste a path manually"):
+    with st.expander("Advanced: paste a path"):
         manual = st.text_input(
             "Folder path",
             placeholder="/THENEWFACE/02_PROJECTS/…/Bucherer" if is_dropbox else r"C:\path\to\Bucherer",
