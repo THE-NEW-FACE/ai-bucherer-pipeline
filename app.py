@@ -585,13 +585,15 @@ def _path_exists(path) -> bool:
         return False
 
 
+# NOTE: the api_key arg is part of the cache key (no leading underscore), so a
+# changed secret rebuilds the client automatically — no app reboot needed.
 @st.cache_resource(show_spinner=False)
-def get_anthropic_client():
+def get_anthropic_client(api_key: str):
     return AnthropicClient(cfg)
 
 
 @st.cache_resource(show_spinner=False)
-def get_gemini_client():
+def get_gemini_client(api_key: str):
     return GeminiClient(cfg)
 
 
@@ -1305,11 +1307,12 @@ def render_sidebar():
         st.caption(
             f"Model: `{cfg.gemini_model}`  ·  {cfg.gemini_aspect_ratio} · {cfg.gemini_image_size}"
         )
-        a_ok = "✓" if cfg.anthropic_api_key else "✗"
-        g_ok = "✓" if cfg.gemini_api_key else "✗"
-        st.caption(f"ANTHROPIC: {a_ok}    GEMINI: {g_ok}")
+        def _fp(k: str) -> str:
+            return f"✓ {len(k)} chars …{k[-4:]}" if k else "✗ missing"
+        st.caption(f"ANTHROPIC: {_fp(cfg.anthropic_api_key)}")
+        st.caption(f"GEMINI: {_fp(cfg.gemini_api_key)}")
         if not cfg.anthropic_api_key or not cfg.gemini_api_key:
-            st.warning("Missing keys in `_auto_pipeline/.env` — restart app after fixing.")
+            st.warning("Missing keys — set them in Streamlit Secrets (or `.env` locally).")
 
 
 # ═══ Route: LANDING ══════════════════════════════════════════════════════
@@ -1599,7 +1602,7 @@ def render_create_project_page():
             for photo in pending:
                 fut = P.submit_regenerate(
                     cfg, mf, photo,
-                    get_anthropic_client(), get_gemini_client(),
+                    get_anthropic_client(cfg.anthropic_api_key), get_gemini_client(cfg.gemini_api_key),
                     n=st.session_state.get("n_variants_slider", cfg.default_n),
                 )
                 pending_dict[photo.photo_id] = fut
@@ -1926,7 +1929,7 @@ def render_board_page():
                         continue
                     fut = P.submit_regenerate(
                         cfg, manifest, photo,
-                        get_anthropic_client(), get_gemini_client(),
+                        get_anthropic_client(cfg.anthropic_api_key), get_gemini_client(cfg.gemini_api_key),
                         n=st.session_state.get("n_variants_slider", cfg.default_n),
                     )
                     pending[photo.photo_id] = fut
@@ -2268,7 +2271,7 @@ def render_photo_card(photo: M.PhotoState):
                     if existing is not None and not existing.done():
                         st.toast(f"Prompt already generating for {photo.photo_id}.", icon="⏳")
                     else:
-                        pfut = P.submit_generate_prompt(cfg, manifest, photo, get_anthropic_client())
+                        pfut = P.submit_generate_prompt(cfg, manifest, photo, get_anthropic_client(cfg.anthropic_api_key))
                         pending_p[photo.photo_id] = pfut
                         st.rerun()
                 except Exception as e:
@@ -2309,7 +2312,7 @@ def _handle_regenerate(
             return
         fut = P.submit_regenerate(
             cfg, manifest, photo,
-            get_anthropic_client(), get_gemini_client(),
+            get_anthropic_client(cfg.anthropic_api_key), get_gemini_client(cfg.gemini_api_key),
             reference_override=reference_override,
             n=n_variants or st.session_state.get("n_variants_slider", cfg.default_n),
         )
