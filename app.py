@@ -1331,7 +1331,8 @@ def render_landing_page():
     with head_r:
         if st.button("➕  New project", type="primary", use_container_width=True,
                      key="landing_new_project"):
-            for k in ("wiz_brand", "wiz_output", "wiz_name", "wiz_products"):
+            for k in ("wiz_browse", "wiz_descend", "wiz_manual", "wiz_browse_crumb",
+                      "wiz_output", "wiz_name", "wiz_products"):
                 st.session_state.pop(k, None)
             set_route("create")
             st.rerun()
@@ -1407,6 +1408,66 @@ def render_landing_page():
 
 # ═══ Route: CREATE (new project wizard) ══════════════════════════════════
 
+def _brand_folder_picker(is_dropbox: bool) -> str:
+    """Click-through folder browser. Returns the currently-selected folder path.
+
+    Navigation lives in session_state['wiz_browse']. A collapsed expander offers a
+    manual path entry for power users; when filled it overrides the browser.
+    """
+    root = "/" if is_dropbox else str(Path.home())
+    cur = st.session_state.get("wiz_browse") or root
+    try:
+        ok = ST.is_dir(cur)
+    except Exception:
+        ok = False
+    if not ok:
+        cur = root
+        st.session_state["wiz_browse"] = cur
+
+    st.caption("Navigate to the folder that contains one subfolder per product.")
+
+    # Breadcrumb (read-only) + up one level
+    bc1, bc2 = st.columns([5, 1])
+    with bc1:
+        st.text_input(
+            "Current folder", value=cur, disabled=True,
+            key="wiz_browse_crumb", label_visibility="collapsed",
+        )
+    with bc2:
+        at_root = (cur == root) or (ST.parent(cur) == cur)
+        if st.button("⬆ Up", disabled=at_root, use_container_width=True, key="wiz_up"):
+            st.session_state["wiz_browse"] = ST.parent(cur)
+            st.rerun()
+
+    # Descend into a subfolder
+    names = [ST.name(s) for s in ST.list_subdirs(cur)]
+    if names:
+        oc1, oc2 = st.columns([5, 1])
+        with oc1:
+            target = st.selectbox(
+                "Open subfolder", ["—"] + names,
+                key="wiz_descend", label_visibility="collapsed",
+            )
+        with oc2:
+            if st.button("Open ▸", disabled=(target == "—"),
+                         use_container_width=True, key="wiz_open"):
+                st.session_state["wiz_browse"] = ST.join(cur, target)
+                st.rerun()
+    else:
+        st.caption("No subfolders inside this folder.")
+
+    with st.expander("Or paste a path manually"):
+        manual = st.text_input(
+            "Folder path",
+            placeholder="/THENEWFACE/02_PROJECTS/…/Bucherer" if is_dropbox else r"C:\path\to\Bucherer",
+            key="wiz_manual",
+        ).strip()
+        if manual:
+            return manual
+
+    return cur
+
+
 def render_create_project_page():
     st.title("Create new project")
 
@@ -1417,13 +1478,7 @@ def render_create_project_page():
     st.markdown("##### 1) Choose folders")
 
     _dropbox = getattr(ST, "backend", "local") == "dropbox"
-    brand_text = st.text_input(
-        "Brand folder (contains one subfolder per product)",
-        value=st.session_state.get("wiz_brand", ""),
-        placeholder="/THENEWFACE/02_PROJECTS/…/Bucherer" if _dropbox else r"C:\path\to\Bucherer",
-        key="wiz_brand",
-    )
-    brand_root = brand_text.strip()
+    brand_root = _brand_folder_picker(_dropbox)
     brand_valid = bool(brand_root and ST.exists(brand_root) and ST.is_dir(brand_root))
     if brand_root and not brand_valid:
         st.warning(f"Folder doesn't exist: {brand_root}")
@@ -1448,14 +1503,15 @@ def render_create_project_page():
     )
 
     if not brand_valid:
-        st.info("Pick a brand folder to continue.")
+        st.info("Navigate to (or paste) the brand folder to continue.")
         return
 
     # Discover products on the fly
     discovered = PROJ.discover_product_groups(cfg, brand_root)
     if not discovered:
-        st.error(
-            f"No image-containing subfolders found in `{brand_root}`. Expected layout:\n\n"
+        st.info(
+            "No product image-folders here yet — keep navigating into the folder that "
+            "holds one subfolder per product. Expected layout:\n\n"
             "```\nBrand/\n  01_Product/\n    img1.png\n    img2.png\n  01_worn/\n    ...\n```"
         )
         return

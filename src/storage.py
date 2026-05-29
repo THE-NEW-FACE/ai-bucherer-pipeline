@@ -230,6 +230,8 @@ class DropboxStorage:
 
     # -- io --
     def exists(self, path: str) -> bool:
+        if self._norm(path) == "/":
+            return True  # namespace root always exists; metadata lookup on it errors
         import dropbox
         try:
             self._client().files_get_metadata(self._norm(path))
@@ -238,6 +240,8 @@ class DropboxStorage:
             return False
 
     def is_dir(self, path: str) -> bool:
+        if self._norm(path) == "/":
+            return True  # the root is always a directory
         import dropbox
         from dropbox.files import FolderMetadata
         try:
@@ -249,10 +253,12 @@ class DropboxStorage:
     def _list(self, path: str, want_dirs: bool) -> list[str]:
         from dropbox.files import FolderMetadata, FileMetadata
         base = self._norm(path)
+        # Dropbox lists the namespace root with "" (an empty string), not "/".
+        arg = "" if base == "/" else base
         dbx = self._client()
         out: list[str] = []
         try:
-            res = dbx.files_list_folder(base)
+            res = dbx.files_list_folder(arg)
         except Exception:
             return []
         while True:
