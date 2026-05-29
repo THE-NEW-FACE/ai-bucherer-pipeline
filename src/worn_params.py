@@ -68,12 +68,12 @@ OPTIONS: dict[str, dict[str, dict[str, str]]] = {
         "editorial_bronze_glow": {
             "label": "Editorial Bronze Glow",
             "thumb": "makeup__editorial_bronze_glow.jpg",
-            "desc": "editorial bronze-glow beauty — warm nude-brown lips with a soft gloss, softly bronzed cheeks, natural defined brows, and a glowing radiant complexion",
+            "desc": "editorial bronze-glow beauty — soft pink lips with a subtle gloss, softly bronzed cheeks, natural defined brows, and a glowing radiant complexion",
         },
         "glossy_lip_beauty": {
             "label": "Glossy Lip Beauty",
             "thumb": "makeup__glossy_lip_beauty.jpg",
-            "desc": "clean glossy-lip beauty — full hydrated pink-coral lips with a soft dewy gloss, subtle peachy cheeks, natural brows, and luminous skin",
+            "desc": "clean glossy-lip beauty — full hydrated soft pink lips with a soft dewy gloss, subtle peachy cheeks, natural brows, and luminous skin",
         },
     },
     "HAIR_STYLE": {

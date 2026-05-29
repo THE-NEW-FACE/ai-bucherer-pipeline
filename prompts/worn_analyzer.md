@@ -37,7 +37,7 @@ The render is bare-shouldered — dress her in {CLOTHING} in {CLOTHING_MATERIAL}
 
 Render the jewellery in [real materials, e.g. polished 18k yellow gold and white brilliant-cut diamonds]: crisp specular highlights, each element clearly separated, picking up a faint warm skin reflection where it rests against the skin.
 
-Soft, diffuse studio portrait lighting — a large overhead softbox key with gentle fill from camera-left — even, flattering exposure and luminous skin with natural pores, on a clean pure-white seamless background. Medium-format look, 80mm lens at f/4, ISO 100, tack-sharp on the jewellery. The final image reads as a real studio photograph.
+Soft, diffuse studio portrait lighting — a large overhead softbox key with gentle fill from camera-left — even, flattering exposure and luminous skin with natural pores, on a clean pure-white seamless background. Medium-format look, 80mm lens at f/4, ISO 100, tack-sharp on the jewellery. An elevated, quiet-luxury editorial jewellery-campaign packshot in the style of Tiffany, Bulgari and Louis Vuitton — refined and minimal, the jewellery the unmistakable hero, reading as a real studio photograph, not a render.
 ```
 
 ## Self-check before sending
@@ -63,5 +63,5 @@ The render is bare-shouldered — dress her in {CLOTHING} in {CLOTHING_MATERIAL}
 
 Render the jewellery in polished 18k yellow gold: crisp specular highlights, the hoop's curve clearly defined, picking up a faint warm skin reflection where it rests against the earlobe.
 
-Soft, diffuse studio portrait lighting — a large overhead softbox key with gentle fill from camera-left — even, flattering exposure and luminous skin with natural pores, on a clean pure-white seamless background. Medium-format look, 80mm lens at f/4, ISO 100, tack-sharp on the jewellery. The final image reads as a real studio photograph.
+Soft, diffuse studio portrait lighting — a large overhead softbox key with gentle fill from camera-left — even, flattering exposure and luminous skin with natural pores, on a clean pure-white seamless background. Medium-format look, 80mm lens at f/4, ISO 100, tack-sharp on the jewellery. An elevated, quiet-luxury editorial jewellery-campaign packshot in the style of Tiffany, Bulgari and Louis Vuitton — refined and minimal, the jewellery the unmistakable hero, reading as a real studio photograph, not a render.
 ```
