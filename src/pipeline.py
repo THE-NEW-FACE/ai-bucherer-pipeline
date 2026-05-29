@@ -78,7 +78,25 @@ def detect_aspect_ratio(image_path: Path) -> str:
 _REGEN_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _PROMPT_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _GRADE_EXECUTOR: Optional[ThreadPoolExecutor] = None
+# Guards in-memory manifest MUTATIONS only — NOT the network write. Holding a global
+# lock across a Dropbox upload serialized every worker (the manifest carries large
+# worn templates now), which made parallel regenerates look sequential.
 _MANIFEST_LOCK = threading.Lock()
+
+
+def _persist(cfg: Config, manifest: M.Manifest) -> None:
+    """Save the manifest without serializing workers on the network write.
+
+    The JSON snapshot is taken under `_MANIFEST_LOCK` (microseconds, keeps the
+    snapshot internally consistent), but the actual Storage upload happens OUTSIDE
+    the lock so concurrent workers don't queue behind each other's Dropbox writes.
+    Concurrent uploads are last-writer-wins on a shared object — every snapshot is a
+    full consistent state, and the in-memory manifest stays the source of truth, so a
+    transiently-stale on-disk write is self-corrected by the next save."""
+    st = get_storage(cfg)
+    with _MANIFEST_LOCK:
+        data = manifest.to_json()
+    st.write_text(M.manifest_path(st, manifest.output_root), data)
 
 
 def _get_executor() -> ThreadPoolExecutor:
@@ -314,33 +332,33 @@ def _prepare_worn_prompt(
     """
     st = get_storage(cfg)
 
+    # Run the (slow) analyzer call OUTSIDE the lock; only mutate + persist after.
+    res = None
     if not photo.worn_template:
         res = anthropic_client.analyze_worn(
             Path(st.materialize(photo.input_path)),
             system_prompt=cfg.get_worn_analyzer(),
             materials_description=(materials_description or photo.brief_notes or ""),
         )
-        with _MANIFEST_LOCK:
+    truncated = bool(res is not None and res.stop_reason == "max_tokens")
+
+    # One short mutation under the lock, then a single persist outside it.
+    with _MANIFEST_LOCK:
+        if res is not None:
             photo.worn_template = res.text
             photo.cost_usd += res.cost_usd
             manifest.total_cost_usd += res.cost_usd
-            if res.stop_reason == "max_tokens":
-                photo.last_error = (
-                    "⚠ Worn analyzer output truncated — raise anthropic.analyzer_max_tokens in config.yaml."
-                )
-            M.save(manifest, st)
-
-    # Randomize styling parameters on the first prepare (auto-prepare requirement).
-    if not photo.worn_params:
-        with _MANIFEST_LOCK:
+        # Randomize styling parameters on the first prepare (auto-prepare requirement).
+        if not photo.worn_params:
             photo.worn_params = WP.random_params()
-            M.save(manifest, st)
-
-    with _MANIFEST_LOCK:
         photo.prompt = WP.assemble(photo.worn_template, photo.worn_params)
-        if photo.last_error and "truncated" in (photo.last_error or ""):
+        if truncated:
+            photo.last_error = (
+                "⚠ Worn analyzer output truncated — raise anthropic.analyzer_max_tokens in config.yaml."
+            )
+        elif photo.last_error and "truncated" in (photo.last_error or ""):
             photo.last_error = None
-        M.save(manifest, st)
+    _persist(cfg, manifest)
 
 
 def generate_prompt_for(
@@ -367,7 +385,7 @@ def generate_prompt_for(
         except Exception as e:
             with _MANIFEST_LOCK:
                 photo.last_error = f"Worn analyzer failed ({e}); used legacy brief."
-                M.save(manifest, st)
+            _persist(cfg, manifest)
             # fall through to the legacy brief path
 
     # Packshot shots use ONLY the input 3D render as reference (Image 1).
@@ -395,7 +413,7 @@ def generate_prompt_for(
             # Clear any previous truncation warning on successful clean output
             if photo.last_error and "truncated" in photo.last_error:
                 photo.last_error = None
-        M.save(manifest, st)
+    _persist(cfg, manifest)
 
 
 def generate_variants_for(
@@ -462,7 +480,7 @@ def generate_variants_for(
         photo.cost_usd += batch.cost_usd
         photo.last_error = "; ".join(batch.errors) if batch.errors else None
         manifest.total_cost_usd += batch.cost_usd
-        M.save(manifest, st)
+    _persist(cfg, manifest)
 
 
 def submit_regenerate(
@@ -491,7 +509,7 @@ def submit_regenerate(
         except Exception as e:
             with _MANIFEST_LOCK:
                 photo.last_error = str(e)
-                M.save(manifest, get_storage(cfg))
+            _persist(cfg, manifest)
             raise
 
     return _get_executor().submit(_task)
@@ -508,6 +526,8 @@ def submit_generate_prompt(
     Kick off Claude classify + prompt generation in the prompt executor.
     Returns a Future so the UI can poll completion without blocking.
     `force=True` (default) wipes photo.prompt first so generate_prompt_for actually re-runs.
+    For worn shots it also clears the cached analyzer template, so "(Re)generate prompt"
+    means a genuinely fresh analysis (not just re-assembling the same template).
     """
     def _task():
         try:
@@ -516,11 +536,13 @@ def submit_generate_prompt(
             if force:
                 with _MANIFEST_LOCK:
                     photo.prompt = None
+                    if (photo.classification or "packshot") == "worn":
+                        photo.worn_template = None
             generate_prompt_for(cfg, manifest, photo, anthropic_client)
         except Exception as e:
             with _MANIFEST_LOCK:
                 photo.last_error = str(e)
-                M.save(manifest, get_storage(cfg))
+            _persist(cfg, manifest)
             raise
 
     return _get_prompt_executor().submit(_task)
@@ -573,9 +595,10 @@ def select_variant(
     graded = grade_image(src_bytes, photo.classification or "packshot", hero_rgb=hero_rgb)
     st.write_bytes(photo.output_path, graded)
 
-    photo.selected_variant = variant_path
-    photo.graded = True
-    M.save(manifest, st)
+    with _MANIFEST_LOCK:
+        photo.selected_variant = variant_path
+        photo.graded = True
+    _persist(cfg, manifest)
 
 
 def submit_grade(
@@ -593,7 +616,7 @@ def submit_grade(
         except Exception as e:
             with _MANIFEST_LOCK:
                 photo.last_error = f"Grading failed: {e}"
-                M.save(manifest, get_storage(cfg))
+            _persist(cfg, manifest)
             raise
 
     return _get_grade_executor().submit(_task)
