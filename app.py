@@ -2326,6 +2326,44 @@ def render_board_page():
                 unsafe_allow_html=True,
             )
 
+    # ── Project-wide: re-analyze worn prompts with the current prompt engineering.
+    # Existing worn photos cache their analyzer template; this clears+re-runs it so
+    # the whole project picks up prompt changes (concise style, soft-pink lips,
+    # brand elevation) at once. Prompts only — does not regenerate images.
+    worn_photos = [p for p in manifest.photos.values()
+                   if (p.classification or "packshot") == "worn"]
+    if worn_photos:
+        n_worn = len(worn_photos)
+        n_worn_running = sum(
+            1 for p in worn_photos
+            if (pending_p.get(p.photo_id) is not None and not pending_p[p.photo_id].done())
+        )
+        with st.expander(f"🔄 Refresh worn prompts ({n_worn})", expanded=False):
+            st.caption(
+                "Re-runs the analyzer on every worn shot with the latest prompt engineering "
+                "(concise style, soft-pink lips, Tiffany / Bulgari / Louis Vuitton elevation), "
+                "keeping each photo's styling parameters. Updates the prompts only — it does "
+                "not regenerate images (regenerate per photo, or Auto-prepare, when ready). "
+                "≈ $0.02 per shot."
+            )
+            if n_worn_running:
+                st.caption(f"⚙ {n_worn_running} worn prompt(s) re-analyzing…")
+            if st.button(
+                f"Re-analyze all {n_worn} worn prompts",
+                key="refresh_worn_prompts",
+                disabled=(not cfg.anthropic_api_key) or n_worn_running > 0,
+                use_container_width=True,
+            ):
+                pp = st.session_state.setdefault("pending_prompts", {})
+                for photo in worn_photos:
+                    ex = pp.get(photo.photo_id)
+                    if ex is not None and not ex.done():
+                        continue
+                    pp[photo.photo_id] = P.submit_generate_prompt(
+                        cfg, manifest, photo, get_anthropic_client(cfg.anthropic_api_key)
+                    )
+                st.rerun()
+
     # Subtle hint about navigation (shown once at the top, not per card)
     st.markdown(
         "<div style='font-size:12px;color:var(--text-3);margin-top:4px;"
