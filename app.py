@@ -649,20 +649,115 @@ def require_password() -> None:
 
 # ═══ Helpers (dialogs, thumbnails, compliance) ═══════════════════════════
 
+def _cb_fs_step(delta: int) -> None:
+    """Move the fullscreen lightbox to the next/previous image (wraps around)."""
+    imgs = st.session_state.get("fs_images", [])
+    if not imgs:
+        return
+    cur = st.session_state.get("fs_index", 0)
+    st.session_state["fs_index"] = (cur + delta) % len(imgs)
+
+
+def _inject_arrow_key_nav() -> None:
+    """Bridge ←/→ keypresses to the lightbox's ◀/▶ buttons.
+
+    The component runs in a same-origin srcdoc iframe, so it can reach the parent
+    Streamlit document and click the nav buttons by their glyph. We keep a single
+    handler on the parent (removing any prior one) so reruns don't stack listeners.
+    If the parent is unreachable (strict CSP), the on-screen ◀/▶ buttons still work.
+    """
+    from streamlit.components.v1 import html as st_html
+    st_html(
+        """
+        <script>
+        (function(){
+          try {
+            const doc = window.parent.document;
+            // Returns true only if a matching nav button exists (i.e. the lightbox
+            // is open). We preventDefault ONLY then, so once the dialog closes the
+            // lingering handler stops swallowing arrow keys app-wide.
+            function clickGlyph(g){
+              const bs = doc.querySelectorAll('button');
+              for (const b of bs){ if ((b.innerText||'').trim() === g){ b.click(); return true; } }
+              return false;
+            }
+            if (window.parent.__fsKeyHandler){
+              doc.removeEventListener('keydown', window.parent.__fsKeyHandler);
+            }
+            const h = function(e){
+              const t = e.target;
+              if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
+              if (e.key === 'ArrowLeft'){ if (clickGlyph('\\u25C0')) e.preventDefault(); }
+              else if (e.key === 'ArrowRight'){ if (clickGlyph('\\u25B6')) e.preventDefault(); }
+            };
+            window.parent.__fsKeyHandler = h;
+            doc.addEventListener('keydown', h);
+          } catch (err) { /* cross-origin / CSP — buttons still work */ }
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
 @st.dialog("Full-size view", width="large")
-def _show_fullscreen(image_path: str, caption: str = ""):
+def _show_fullscreen():
+    """Lightbox over `st.session_state['fs_images']` (list of (path, caption)) at index
+    `fs_index`. With more than one image, ◀/▶ buttons and the ←/→ arrow keys navigate."""
+    imgs = st.session_state.get("fs_images", [])
+    if not imgs:
+        st.error("No image to show.")
+        return
+    idx = max(0, min(st.session_state.get("fs_index", 0), len(imgs) - 1))
+    image_path, caption = imgs[idx]
+
     if not _path_exists(image_path):
         st.error(f"File not found: {image_path}")
         return
     p = _local(image_path)
     img = Image.open(p)
-    if caption:
+
+    if len(imgs) > 1:
+        cprev, cmid, cnext = st.columns([1, 4, 1])
+        with cprev:
+            st.button("◀", key="fs_prev", use_container_width=True,
+                      help="Previous (←)", on_click=_cb_fs_step, args=(-1,))
+        with cmid:
+            st.markdown(
+                f"<div style='text-align:center;font-weight:600;'>"
+                f"{caption or Path(image_path).name}"
+                f"<span style='color:var(--text-3);font-weight:400;'> · {idx + 1} / {len(imgs)}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with cnext:
+            st.button("▶", key="fs_next", use_container_width=True,
+                      help="Next (→)", on_click=_cb_fs_step, args=(1,))
+    elif caption:
         st.markdown(f"**{caption}**")
+
     try:
         st.image(img, use_container_width=True)
     except TypeError:
         st.image(img, width="stretch")
     st.caption(f"{img.size[0]}×{img.size[1]} px · {p.stat().st_size // 1024} KB")
+
+    if len(imgs) > 1:
+        _inject_arrow_key_nav()
+
+
+def _open_fullscreen(images, index: int = 0, title: str = "") -> None:
+    """Seed the lightbox session state and open it. `images` is a list of either
+    plain paths or (path, caption) tuples."""
+    norm = []
+    for it in images:
+        if isinstance(it, (tuple, list)):
+            norm.append((str(it[0]), it[1] if len(it) > 1 else ""))
+        else:
+            norm.append((str(it), ""))
+    st.session_state["fs_images"] = norm
+    st.session_state["fs_index"] = max(0, min(index, len(norm) - 1)) if norm else 0
+    _show_fullscreen()
 
 
 @st.dialog("Before / After", width="large")
@@ -766,7 +861,14 @@ def thumb(
     caption: str | None = None,
     fs_key: str | None = None,
     fs_caption: str | None = None,
+    fs_group: list | None = None,
+    fs_index: int = 0,
 ):
+    """Thumbnail + optional 🔍 Full-size button.
+
+    When `fs_group` (a list of paths or (path, caption) tuples) is supplied, the
+    lightbox opens on that group at `fs_index`, so ◀/▶ and the arrow keys flip
+    through the set. Otherwise it opens just this image."""
     name = Path(str(image_path)).name
     if not _path_exists(image_path):
         st.caption(f"_(missing: {name})_")
@@ -779,8 +881,11 @@ def thumb(
         return
     if fs_key:
         if st.button("🔍 Full size", key=fs_key, use_container_width=True,
-                     help="Open in lightbox at near-viewport resolution"):
-            _show_fullscreen(str(image_path), fs_caption or caption or name)
+                     help="Open in lightbox · use ← → to flip through images"):
+            if fs_group:
+                _open_fullscreen(fs_group, fs_index)
+            else:
+                _open_fullscreen([(str(image_path), fs_caption or caption or name)], 0)
 
 
 # ═══ Hover-slider component (board cards) ════════════════════════════════
@@ -947,6 +1052,22 @@ def render_hover_card_html(
     input_url = _image_to_data_url(input_path, max_edge=max_edge)
     overlay_url = _image_to_data_url(overlay_path, max_edge=max_edge) if overlay_path else None
 
+    # Size the card to the input image's TRUE aspect ratio so the slider shows the
+    # real proportions instead of a centre-cropped (object-fit:cover) distortion.
+    try:
+        with Image.open(_local(input_path)) as _im:
+            iw, ih = _im.size
+    except Exception:
+        iw, ih = 1, 1
+    aspect = (iw / ih) if ih else 1.0
+    disp_h = float(height_px)
+    disp_w = disp_h * aspect
+    MAX_W = 700.0  # roughly the content width of a width="large" dialog
+    if disp_w > MAX_W:
+        disp_w = MAX_W
+        disp_h = MAX_W / aspect
+    disp_w, disp_h = int(round(disp_w)), int(round(disp_h))
+
     overlay_html = ""
     if overlay_url:
         overlay_html = f"""
@@ -961,10 +1082,15 @@ def render_hover_card_html(
     <html><head>
     <style>
       html, body {{ margin:0; padding:0; background:transparent; overflow:hidden; }}
+      .wrap {{
+        display:flex; align-items:center; justify-content:center;
+        width:100%; height:{height_px}px;
+      }}
       .card {{
         position:relative;
-        width:100%;
-        height:{height_px}px;
+        width:{disp_w}px;
+        height:{disp_h}px;
+        max-width:100%;
         border-radius:6px;
         overflow:hidden;
         background:#1a1a1a;
@@ -973,7 +1099,7 @@ def render_hover_card_html(
       .card img {{
         position:absolute; inset:0;
         width:100%; height:100%;
-        object-fit:cover;
+        object-fit:contain;
         display:block;
       }}
       .overlay {{
@@ -1002,9 +1128,11 @@ def render_hover_card_html(
     </style>
     </head>
     <body>
-      <div class="card" id="card">
-        <img class="bg" src="{input_url}" draggable="false"/>
-        {overlay_html}
+      <div class="wrap">
+        <div class="card" id="card">
+          <img class="bg" src="{input_url}" draggable="false"/>
+          {overlay_html}
+        </div>
       </div>
       <script>
         (function() {{
@@ -2419,13 +2547,19 @@ def render_photo_card(photo: M.PhotoState):
                     st.caption(f"**Variants ({len(photo.variants)})** — click **Pick** to grade + save")
                     n_cols = min(len(photo.variants), 4)
                     grid = st.columns(n_cols)
+                    # Full-size lightbox flips across all variants with ← →.
+                    variant_group = [
+                        (vp, f"Variant v{j + 1} · {Path(vp).name}")
+                        for j, vp in enumerate(photo.variants)
+                    ]
                     for i, vp in enumerate(photo.variants):
                         with grid[i % n_cols]:
                             is_selected = vp == photo.selected_variant
                             cap = f"v{i + 1} ✓" if is_selected else f"v{i + 1}"
                             thumb(vp, width=thumb_variant, caption=cap,
                                   fs_key=f"fs_var_{photo.photo_id}_{i}",
-                                  fs_caption=f"Variant v{i + 1} · {Path(vp).name}")
+                                  fs_caption=f"Variant v{i + 1} · {Path(vp).name}",
+                                  fs_group=variant_group, fs_index=i)
                             if st.button("🆚 Compare", key=f"cmp_{photo.photo_id}_{i}",
                                          use_container_width=True,
                                          help="Slide between input render and this variant"):
