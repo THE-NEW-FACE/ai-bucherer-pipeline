@@ -687,10 +687,11 @@ def _show_comparison(
         st.markdown(f"**{title}**")
 
     from streamlit.components.v1 import html as st_html
-    # Larger max_edge for the modal (still 1280 — full-res 2K is overkill here).
+    # max_edge=900 matches the board's compare-slider size and keeps the encode/
+    # payload light; full-res 2K is overkill in a 560px-tall modal.
     # render_hover_card_html materializes Storage paths internally.
     html_payload = render_hover_card_html(
-        str(before_path), str(after_path), height_px=560, max_edge=1280,
+        str(before_path), str(after_path), height_px=560, max_edge=900,
     )
     st_html(html_payload, height=576, scrolling=False)
 
@@ -822,6 +823,37 @@ def _image_to_data_url(path, max_edge: int = 900) -> str:
     except OSError:
         mtime = 0.0
     return _cached_data_url(str(local), mtime, max_edge)
+
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def _cached_thumb_bytes(path_str: str, mtime: float, max_edge: int) -> bytes:
+    """Downscaled JPEG bytes, cached by (path, mtime, max_edge). Used by the board
+    grid so each card ships a small thumbnail instead of a full-res 2K image —
+    decoded/encoded once, reused across every rerun (and every autorefresh tick)."""
+    try:
+        img = Image.open(path_str).convert("RGB")
+        if max(img.size) > max_edge:
+            scale = max_edge / max(img.size)
+            img = img.resize(
+                (int(img.size[0] * scale), int(img.size[1] * scale)), Image.LANCZOS
+            )
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return b""
+
+
+def _board_thumb(path, max_edge: int = 500):
+    """A small cached JPEG (bytes) for st.image on the board. Falls back to the raw
+    local path if thumbnailing fails, so a card always renders something."""
+    local = _local(path)
+    try:
+        mtime = local.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    data = _cached_thumb_bytes(str(local), mtime, max_edge)
+    return data if data else str(local)
 
 
 def _folder_images(folder: str) -> list[str]:
@@ -1764,7 +1796,7 @@ def render_board_card(photo: M.PhotoState):
         display_img = photo.input_path
 
     with st.container(key=f"boardimg-{photo.photo_id}"):
-        st.image(str(_local(display_img)), use_container_width=True)
+        st.image(_board_thumb(display_img), use_container_width=True)
 
     # ── 2) Control row — clean toolbar inspired by the Gemini variant card:
     #     ‹  1 / 4  ›        ⤢
