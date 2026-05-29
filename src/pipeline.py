@@ -111,16 +111,33 @@ def _get_grade_executor() -> ThreadPoolExecutor:
 # ── Ingest ──────────────────────────────────────────────────────────────
 
 def discover_images(cfg: Config, brand_root: str) -> list[tuple[str, str]]:
-    """Return [(product_name, image_path)] for every image in brand_root/<product>/."""
+    """Return [(product_name, image_path)] for every image in brand_root/<product>/.
+
+    On the Dropbox backend each `list_files` is a network round-trip, so the per-
+    product listings are fanned out across a thread pool — turning N sequential
+    calls into a handful of concurrent batches. `ThreadPoolExecutor.map` preserves
+    input order, so the result order is identical to the sequential version."""
     st = get_storage(cfg)
-    out: list[tuple[str, str]] = []
     if not st.exists(brand_root):
-        return out
-    for product_dir in st.list_subdirs(brand_root):
+        return []
+    product_dirs = st.list_subdirs(brand_root)
+
+    def _scan(product_dir: str) -> list[tuple[str, str]]:
         product = st.name(product_dir)
-        for img in st.list_files(product_dir):
-            if Path(st.name(img)).suffix.lower() in IMAGE_EXTS:
-                out.append((product, img))
+        return [
+            (product, img)
+            for img in st.list_files(product_dir)
+            if Path(st.name(img)).suffix.lower() in IMAGE_EXTS
+        ]
+
+    out: list[tuple[str, str]] = []
+    if getattr(st, "backend", "local") == "dropbox" and len(product_dirs) > 1:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for res in ex.map(_scan, product_dirs):
+                out.extend(res)
+    else:
+        for pd in product_dirs:
+            out.extend(_scan(pd))
     return out
 
 
@@ -149,16 +166,25 @@ def ingest(
     existing = M.load(output_root, st)
     if existing and existing.brand_root == brand_root:
         manifest = existing
+        dirty = False
     else:
         manifest = M.Manifest(brand_root=brand_root, output_root=output_root)
+        dirty = True
 
     # If a project is provided, sync its briefs + classifications into the manifest.
     # This keeps the manifest a self-contained source of truth (so the pipeline can
-    # run even if the Project JSON is deleted).
+    # run even if the Project JSON is deleted). Only mark dirty when something actually
+    # changed, so re-opening an unchanged project doesn't trigger a manifest re-upload.
     if project is not None:
-        manifest.project_slug = project.slug
-        manifest.product_briefs = project.product_brief_map()
-        manifest.product_classifications = project.product_classification_map()
+        briefs = project.product_brief_map()
+        classes = project.product_classification_map()
+        if (manifest.project_slug != project.slug
+                or manifest.product_briefs != briefs
+                or manifest.product_classifications != classes):
+            manifest.project_slug = project.slug
+            manifest.product_briefs = briefs
+            manifest.product_classifications = classes
+            dirty = True
 
     for product, img in discover_images(cfg, brand_root):
         rel_under_brand = st.relpath(img, brand_root)
@@ -176,21 +202,30 @@ def ingest(
                 output_path=out_path,
                 classification=preset_class,        # None if no project supplied
             )
+            dirty = True
 
-    # Reconcile transient variants. Older manifests (and any pre-persistence run)
-    # recorded variant paths in an ephemeral local scratch dir that no longer exists
-    # — e.g. a previous cloud container's /tmp. Drop dangling references so the board
-    # and the detail view agree and the user is cleanly prompted to regenerate. We
-    # probe only the first variant per photo (they share a dir, so they live or die
-    # together) to keep this to one existence check per photo. The graded output is
-    # persisted separately, so `graded`/`output_path` are left untouched.
+    # Reconcile transient variants WITHOUT any network calls. Variants are persisted
+    # under `<output_root>/.variants/...` (see generate_variants_for). Older manifests
+    # (pre-persistence) recorded paths in an ephemeral local scratch dir — e.g. a prior
+    # cloud container's /tmp — that no longer exists. Those legacy paths are simply the
+    # ones NOT under the storage variants root, so a pure prefix check identifies them
+    # — no per-photo `st.exists` probe (which on Dropbox was one round-trip per photo,
+    # a major chunk of the open-time). Files under .variants are trusted, exactly as the
+    # board/detail display already trusts the manifest (missing files fall back cleanly).
+    variants_root = st.join(output_root, ".variants").replace("\\", "/")
     for photo in manifest.photos.values():
-        if photo.variants and not st.exists(photo.variants[0]):
-            photo.variants = []
-            photo.selected_variant = None
+        if photo.variants:
+            first = str(photo.variants[0]).replace("\\", "/")
+            if not first.startswith(variants_root):
+                photo.variants = []
+                photo.selected_variant = None
+                dirty = True
 
-    st.makedirs(output_root)
-    M.save(manifest, st)
+    # Only touch storage when something actually changed. A no-op re-open then costs
+    # just the manifest read + the (parallel) folder scan — no makedirs, no re-upload.
+    if dirty:
+        st.makedirs(output_root)
+        M.save(manifest, st)
     return manifest
 
 
