@@ -543,6 +543,37 @@ st.markdown(
       border-top: 1px solid var(--border-subtle);
       margin: var(--s-5) 0;
     }
+
+    /* ── Clickable preview images ──
+       thumb() wraps each preview in st.container(key="clk-<id>") and places a
+       button directly after the image. We absolutely-position that button to
+       cover the thumbnail so a click anywhere on the image opens the full-res
+       zoom lightbox. The button itself is invisible (transparent text/bg) and
+       shows a zoom-in cursor — no more separate "🔍 Full size" control. */
+    div[class*="st-key-clk-"] { position: relative; }
+    div[class*="st-key-clk-"] [data-testid="stImage"] { cursor: zoom-in; }
+    div[class*="st-key-clk-"] .stButton {
+      position: absolute; inset: 0; margin: 0; z-index: 6; height: 100%;
+    }
+    div[class*="st-key-clk-"] .stButton button {
+      width: 100%; height: 100%;
+      min-height: 0 !important;
+      background: transparent !important;
+      border: none !important;
+      box-shadow: none !important;
+      color: transparent !important;
+      font-size: 0 !important;        /* hide the label glyph (emoji ignore color) */
+      cursor: zoom-in;
+      padding: 0 !important;
+      transition: background 120ms ease;
+    }
+    div[class*="st-key-clk-"] .stButton button:hover {
+      background: rgba(255,255,255,0.06) !important;
+    }
+    div[class*="st-key-clk-"] .stButton button:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -761,11 +792,15 @@ def _show_fullscreen():
     idx = max(0, min(st.session_state.get("fs_index", 0), len(imgs) - 1))
     image_path, caption = imgs[idx]
 
-    if not _exists_cached(image_path):
+    # Read native dimensions (cheap header read) and build a high-res, cached JPEG
+    # data URL. max_edge=4096 leaves the 2K source renders at native resolution —
+    # a true full-res view — while staying far lighter than a PNG re-encode.
+    try:
+        with Image.open(_local(image_path)) as _im:
+            w, h = _im.size
+    except Exception:
         st.error(f"File not found: {image_path}")
         return
-    p = _local(image_path)
-    img = Image.open(p)
 
     if len(imgs) > 1:
         cprev, cmid, cnext = st.columns([1, 4, 1])
@@ -783,14 +818,12 @@ def _show_fullscreen():
         with cnext:
             st.button("▶", key="fs_next", use_container_width=True,
                       help="Next (→)", on_click=_cb_fs_step, args=(1,))
-    elif caption:
-        st.markdown(f"**{caption}**")
+    else:
+        st.markdown(f"**{caption or Path(image_path).name}**")
 
-    try:
-        st.image(img, use_container_width=True)
-    except TypeError:
-        st.image(img, width="stretch")
-    st.caption(f"{img.size[0]}×{img.size[1]} px · {p.stat().st_size // 1024} KB")
+    from streamlit.components.v1 import html as st_html
+    url = _image_to_data_url(image_path, max_edge=4096, quality=88)
+    st_html(render_zoom_image_html(url, w, h, height_px=520), height=536, scrolling=False)
 
     if len(imgs) > 1:
         _inject_arrow_key_nav()
@@ -914,24 +947,31 @@ def thumb(
     fs_group: list | None = None,
     fs_index: int = 0,
 ):
-    """Thumbnail + optional 🔍 Full-size button.
+    """Clickable preview thumbnail. When `fs_key` is given, the image itself is
+    clickable (an invisible overlay button, styled by the `.st-key-clk-*` CSS) and
+    opens the full-resolution zoom lightbox — there is no separate "Full size"
+    button. When `fs_group` (a list of paths or (path, caption) tuples) is supplied,
+    the lightbox opens on that group at `fs_index`, so ◀/▶ and the arrow keys flip
+    through the set; otherwise it opens just this image.
 
-    When `fs_group` (a list of paths or (path, caption) tuples) is supplied, the
-    lightbox opens on that group at `fs_index`, so ◀/▶ and the arrow keys flip
-    through the set. Otherwise it opens just this image."""
+    Display uses the cached downscaled JPEG (small, decoded/encoded once) rather
+    than re-shipping the full-res 2K image on every rerun — the full-res bytes are
+    only fetched when the user actually opens the lightbox."""
     name = Path(str(image_path)).name
-    # Single materialize+open attempt — no separate existence probe. On the
-    # Dropbox backend that probe was a second network round-trip; if the file is
-    # genuinely missing the open below fails and we show the same "missing" note.
-    try:
-        img = Image.open(_local(image_path))
-        st.image(img, width=width, caption=caption)
-    except Exception:
+    disp = _board_thumb(image_path, max_edge=760)
+    if not isinstance(disp, bytes):  # encode failed → file missing/corrupt
         st.caption(f"_(missing: {name})_")
         return
-    if fs_key:
-        if st.button("🔍 Full size", key=fs_key, use_container_width=True,
-                     help="Open in lightbox · use ← → to flip through images"):
+
+    if not fs_key:
+        st.image(disp, width=width, caption=caption)
+        return
+
+    with st.container(key=f"clk-{fs_key}"):
+        st.image(disp, width=width, caption=caption)
+        if st.button("🔍 Open full resolution", key=fs_key, use_container_width=True,
+                     help="Click the image to view full resolution · scroll to zoom, "
+                          "drag to pan, double-click to reset"):
             if fs_group:
                 _open_fullscreen(fs_group, fs_index)
             else:
@@ -946,10 +986,11 @@ def thumb(
 # We cache by (path, mtime, max_edge) so file edits invalidate naturally.
 
 @st.cache_data(show_spinner=False, max_entries=512)
-def _cached_data_url(path_str: str, mtime: float, max_edge: int) -> str:
+def _cached_data_url(path_str: str, mtime: float, max_edge: int, quality: int = 82) -> str:
     """Cached version of _image_to_data_url. mtime is the cache key — when the file is
     rewritten (e.g. after grading), the cache entry is invalidated automatically.
-    Returns a base64 data URL of the downscaled JPEG."""
+    Returns a base64 data URL of the (optionally downscaled) JPEG. A large max_edge
+    leaves the image at native resolution — used for the full-res zoom lightbox."""
     try:
         img = Image.open(path_str).convert("RGB")
         if max(img.size) > max_edge:
@@ -959,7 +1000,7 @@ def _cached_data_url(path_str: str, mtime: float, max_edge: int) -> str:
                 Image.LANCZOS,
             )
         buf = BytesIO()
-        img.save(buf, format="JPEG", quality=82, optimize=True)
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
         return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
     except Exception:
         return (
@@ -969,7 +1010,7 @@ def _cached_data_url(path_str: str, mtime: float, max_edge: int) -> str:
         )
 
 
-def _image_to_data_url(path, max_edge: int = 900) -> str:
+def _image_to_data_url(path, max_edge: int = 900, quality: int = 82) -> str:
     """Public wrapper — materializes the path to a local file (no-op for local scratch /
     local backend), then keys the cache on mtime so it invalidates on file rewrite."""
     local = _local(path)
@@ -977,7 +1018,7 @@ def _image_to_data_url(path, max_edge: int = 900) -> str:
         mtime = local.stat().st_mtime
     except OSError:
         mtime = 0.0
-    return _cached_data_url(str(local), mtime, max_edge)
+    return _cached_data_url(str(local), mtime, max_edge, quality)
 
 
 @st.cache_data(show_spinner=False, max_entries=512)
@@ -1203,6 +1244,95 @@ def render_hover_card_html(
           // controls or another card without losing their comparison position.
           card.addEventListener('mousemove', e => update(e.clientX));
         }})();
+      </script>
+    </body></html>
+    """
+
+
+def render_zoom_image_html(url: str, w: int, h: int, height_px: int = 520) -> str:
+    """Self-contained pan/zoom viewer for one image, for the full-size lightbox.
+
+    Scroll wheel zooms toward the cursor (1×–8×), drag pans while zoomed, and
+    double-click toggles between fit and a 2.5× zoom at the click point. All of it
+    is client-side CSS transforms, so interaction is instant — the only cost is the
+    one-time (cached) data URL. A single iframe inside the dialog is safe; image-to-
+    image navigation is still driven by the parent ◀/▶ buttons + arrow-key bridge."""
+    return f"""
+    <!doctype html><html><head><style>
+      html,body {{ margin:0; padding:0; background:transparent; overflow:hidden; }}
+      .vp {{
+        position:relative; width:100%; height:{height_px}px;
+        background:#0b0b0d; border-radius:8px; overflow:hidden; cursor:zoom-in;
+      }}
+      .vp.zoomed {{ cursor:grab; }}
+      .vp.grabbing {{ cursor:grabbing; }}
+      .vp img {{
+        position:absolute; left:0; top:0; width:100%; height:100%;
+        object-fit:contain; transform-origin:0 0; will-change:transform;
+        user-select:none; -webkit-user-drag:none;
+      }}
+      .hud, .hint {{
+        position:absolute; bottom:8px;
+        font:12px/1.2 system-ui,Segoe UI,Roboto,sans-serif; color:#fff;
+        background:rgba(0,0,0,0.5); padding:4px 9px; border-radius:99px;
+        pointer-events:none;
+      }}
+      .hud {{ left:10px; font-variant-numeric:tabular-nums; }}
+      .hint {{ right:10px; color:rgba(255,255,255,0.88); transition:opacity .25s ease; }}
+    </style></head><body>
+      <div class="vp" id="vp">
+        <img id="im" src="{url}" draggable="false"/>
+        <div class="hud" id="hud"></div>
+        <div class="hint" id="hint">scroll = zoom · drag = pan · double-click = reset</div>
+      </div>
+      <script>
+      (function(){{
+        const vp=document.getElementById('vp'), im=document.getElementById('im'), hud=document.getElementById('hud'), hint=document.getElementById('hint');
+        const NW={int(w)}, NH={int(h)};
+        let scale=1, tx=0, ty=0, drag=false, sx=0, sy=0;
+        const clamp=(v,a,b)=> v<a?a:(v>b?b:v);
+        function bound(){{
+          const r=vp.getBoundingClientRect();
+          const maxX=Math.max(0, r.width*scale - r.width), maxY=Math.max(0, r.height*scale - r.height);
+          tx=clamp(tx,-maxX,0); ty=clamp(ty,-maxY,0);
+        }}
+        function apply(){{
+          im.style.transform='translate('+tx+'px,'+ty+'px) scale('+scale+')';
+          hud.textContent=Math.round(scale*100)+'%  ·  '+NW+'×'+NH+'px';
+          vp.classList.toggle('zoomed', scale>1.001);
+        }}
+        function zoomAt(cx,cy,f){{
+          const ns=clamp(scale*f,1,8), k=ns/scale;
+          tx=cx-(cx-tx)*k; ty=cy-(cy-ty)*k; scale=ns;
+          if(scale<=1.001){{ scale=1; tx=0; ty=0; }}
+          bound(); apply();
+        }}
+        vp.addEventListener('wheel', function(e){{
+          e.preventDefault();
+          const r=vp.getBoundingClientRect();
+          zoomAt(e.clientX-r.left, e.clientY-r.top, e.deltaY<0 ? 1.15 : 1/1.15);
+        }}, {{passive:false}});
+        vp.addEventListener('mousedown', function(e){{
+          if(scale<=1) return; drag=true; sx=e.clientX; sy=e.clientY;
+          vp.classList.add('grabbing'); e.preventDefault();
+        }});
+        window.addEventListener('mousemove', function(e){{
+          if(!drag) return; tx+=e.clientX-sx; ty+=e.clientY-sy; sx=e.clientX; sy=e.clientY; bound(); apply();
+        }});
+        window.addEventListener('mouseup', function(){{ drag=false; vp.classList.remove('grabbing'); }});
+        vp.addEventListener('dblclick', function(e){{
+          const r=vp.getBoundingClientRect();
+          if(scale>1){{ scale=1; tx=0; ty=0; apply(); }}
+          else {{ zoomAt(e.clientX-r.left, e.clientY-r.top, 2.5); }}
+        }});
+        window.addEventListener('keydown', function(e){{
+          if(e.key==='+'||e.key==='='){{ zoomAt(vp.clientWidth/2, vp.clientHeight/2, 1.2); e.preventDefault(); }}
+          else if(e.key==='-'||e.key==='_'){{ zoomAt(vp.clientWidth/2, vp.clientHeight/2, 1/1.2); e.preventDefault(); }}
+          else if(e.key==='0'){{ scale=1; tx=0; ty=0; apply(); e.preventDefault(); }}
+        }});
+        apply();
+        setTimeout(function(){{ hint.style.opacity='0'; }}, 2600);
+      }})();
       </script>
     </body></html>
     """
