@@ -28,3 +28,10 @@ output:
   suffix: "_OUT"        # input "Bucherer" → output "Bucherer_OUT"
   format: PNG           # PNG | JPEG | WEBP
   jpeg_quality: 95
+
+storage:
+  backend: auto         # auto | local | dropbox.  auto → dropbox when a refresh token is configured, else local.
+  # Dropbox Business team space namespace (the root that holds /THENEWFACE and /The New Face).
+  dropbox_root_namespace: "13667598323"
+  # Where project JSONs live on Dropbox (the local backend keeps using ./projects/).
+  dropbox_projects_dir: "/THENEWFACE/02_PROJECTS/08_Bucherer/_ai_pipeline/projects"

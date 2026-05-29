@@ -51,6 +51,14 @@ class Config:
     output_format: str = "PNG"
     jpeg_quality: int = 95
 
+    # Storage backend
+    storage_backend: str = "auto"          # auto | local | dropbox
+    dropbox_root_namespace: str = ""       # team space namespace id
+    dropbox_projects_dir: str = ""         # where project JSONs live on Dropbox
+
+    # App access gate (shared password for the public deploy)
+    app_password: str = ""
+
     # Fixed prompts
     classifier_prompt: str = ""
     brief_packshot: str = ""
@@ -112,6 +120,18 @@ class Config:
     def dropbox_enabled(self) -> bool:
         return bool(self.dropbox_refresh_token and self.dropbox_app_key) or bool(self.dropbox_token)
 
+    @property
+    def dropbox_team_ready(self) -> bool:
+        """True when we have durable team-app credentials (refresh token + app key/secret)."""
+        return bool(self.dropbox_refresh_token and self.dropbox_app_key and self.dropbox_app_secret)
+
+    @property
+    def effective_storage_backend(self) -> str:
+        """Resolve 'auto' → 'dropbox' when team credentials exist, else 'local'."""
+        if self.storage_backend in ("local", "dropbox"):
+            return self.storage_backend
+        return "dropbox" if self.dropbox_team_ready else "local"
+
 
 def _secret(name: str, default: str = "") -> str:
     """Resolve a secret. Prefer st.secrets (Streamlit Cloud) and fall back to the
@@ -144,6 +164,7 @@ def load_config() -> Config:
     gemini = cfg_yaml.get("gemini", {})
     anthropic = cfg_yaml.get("anthropic", {})
     output = cfg_yaml.get("output", {})
+    storage = cfg_yaml.get("storage", {})
 
     cfg = Config(
         anthropic_api_key=_secret("ANTHROPIC_API_KEY"),
@@ -171,6 +192,10 @@ def load_config() -> Config:
         output_suffix=str(output.get("suffix", "_OUT")),
         output_format=str(output.get("format", "PNG")).upper(),
         jpeg_quality=int(output.get("jpeg_quality", 95)),
+        storage_backend=str(storage.get("backend", "auto")).lower(),
+        dropbox_root_namespace=str(storage.get("dropbox_root_namespace", "")),
+        dropbox_projects_dir=str(storage.get("dropbox_projects_dir", "")),
+        app_password=_secret("APP_PASSWORD"),
     )
 
     prompts = root / "prompts"

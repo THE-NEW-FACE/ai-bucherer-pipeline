@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
+import tempfile
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -15,6 +17,7 @@ from .config import Config
 from .gemini_client import GeminiClient
 from .grader import grade_image
 from .project import Project
+from .storage import Storage, get_storage
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
 
@@ -106,39 +109,47 @@ def _get_grade_executor() -> ThreadPoolExecutor:
 
 # ── Ingest ──────────────────────────────────────────────────────────────
 
-def discover_images(brand_root: Path) -> list[tuple[str, Path]]:
+def discover_images(cfg: Config, brand_root: str) -> list[tuple[str, str]]:
     """Return [(product_name, image_path)] for every image in brand_root/<product>/."""
-    out: list[tuple[str, Path]] = []
-    if not brand_root.exists():
+    st = get_storage(cfg)
+    out: list[tuple[str, str]] = []
+    if not st.exists(brand_root):
         return out
-    for product_dir in sorted(p for p in brand_root.iterdir() if p.is_dir()):
-        for img in sorted(product_dir.iterdir()):
-            if img.is_file() and img.suffix.lower() in IMAGE_EXTS:
-                out.append((product_dir.name, img))
+    for product_dir in st.list_subdirs(brand_root):
+        product = st.name(product_dir)
+        for img in st.list_files(product_dir):
+            if Path(st.name(img)).suffix.lower() in IMAGE_EXTS:
+                out.append((product, img))
     return out
 
 
-def default_output_root(cfg: Config, brand_root: Path) -> Path:
-    return brand_root.parent / f"{brand_root.name}{cfg.output_suffix}"
+def default_output_root(cfg: Config, brand_root: str) -> str:
+    st = get_storage(cfg)
+    parent = st.parent(brand_root)
+    return st.join(parent, f"{st.name(brand_root)}{cfg.output_suffix}")
 
 
 def ingest(
     cfg: Config,
-    brand_root: Path,
-    output_root: Path,
+    brand_root: str,
+    output_root: str,
     project: Optional[Project] = None,
 ) -> M.Manifest:
-    """Build (or top-up) manifest from on-disk brand folder.
+    """Build (or top-up) manifest from the brand folder.
 
     If `project` is supplied, its per-product briefs and classifications are written
     into the manifest, and new photos get their `classification` and `brief_notes`
     pre-filled from the matching ProductGroup — no Claude vision call needed.
     """
-    existing = M.load(output_root)
-    if existing and existing.brand_root == str(brand_root):
+    st = get_storage(cfg)
+    brand_root = str(brand_root)
+    output_root = str(output_root)
+
+    existing = M.load(output_root, st)
+    if existing and existing.brand_root == brand_root:
         manifest = existing
     else:
-        manifest = M.Manifest(brand_root=str(brand_root), output_root=str(output_root))
+        manifest = M.Manifest(brand_root=brand_root, output_root=output_root)
 
     # If a project is provided, sync its briefs + classifications into the manifest.
     # This keeps the manifest a self-contained source of truth (so the pipeline can
@@ -148,10 +159,10 @@ def ingest(
         manifest.product_briefs = project.product_brief_map()
         manifest.product_classifications = project.product_classification_map()
 
-    for product, img in discover_images(brand_root):
-        rel_under_brand = img.relative_to(brand_root)
-        out_path = output_root / rel_under_brand
-        photo_id = f"{product}/{img.name}"
+    for product, img in discover_images(cfg, brand_root):
+        rel_under_brand = st.relpath(img, brand_root)
+        out_path = st.join(output_root, rel_under_brand)
+        photo_id = f"{product}/{st.name(img)}"
         if photo_id not in manifest.photos:
             # Pre-fill classification from the project's product map (skips Claude vision
             # classify call). brief_notes stays empty — the per-product description lives
@@ -159,42 +170,52 @@ def ingest(
             # as a per-photo user note. brief_notes is reserved for per-photo overrides.
             preset_class = manifest.product_classifications.get(product)
             manifest.photos[photo_id] = M.PhotoState(
-                input_path=str(img),
+                input_path=img,
                 product=product,
-                output_path=str(out_path),
+                output_path=out_path,
                 classification=preset_class,        # None if no project supplied
             )
 
-    output_root.mkdir(parents=True, exist_ok=True)
-    M.save(manifest)
+    st.makedirs(output_root)
+    M.save(manifest, st)
     return manifest
 
 
 # ── Workspace paths ─────────────────────────────────────────────────────
+# Variants are transient scratch — kept on a real local disk (even when the
+# storage backend is Dropbox) so we don't litter the cloud folder with throwaway
+# renders or pay upload/download latency on every regenerate. Only the chosen,
+# graded output is persisted through Storage.
 
-def workspace_dir(output_root: Path, product: str, photo_stem: str) -> Path:
-    return output_root / ".workspace" / product / photo_stem
+def _workspace_base(output_root: str) -> Path:
+    key = hashlib.sha256(str(output_root).encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / "ai_bucherer_workspace" / key
 
 
-def clear_workspace_for(output_root: Path, photo: M.PhotoState) -> None:
+def workspace_dir(output_root: str, product: str, photo_stem: str) -> Path:
+    return _workspace_base(output_root) / product / photo_stem
+
+
+def clear_workspace_for(output_root: str, photo: M.PhotoState) -> None:
     stem = Path(photo.input_path).stem
     ws = workspace_dir(output_root, photo.product, stem)
     if ws.exists():
         shutil.rmtree(ws, ignore_errors=True)
 
 
-def tidy_all_workspaces(output_root: Path, manifest: M.Manifest) -> int:
+def tidy_all_workspaces(cfg: Config, manifest: M.Manifest) -> int:
     """Delete workspace dirs for photos whose selection is already on disk. Returns count cleaned."""
+    st = get_storage(cfg)
     cleaned = 0
     for photo in manifest.photos.values():
         if photo.graded and photo.selected_variant:
             stem = Path(photo.input_path).stem
-            ws = workspace_dir(output_root, photo.product, stem)
+            ws = workspace_dir(manifest.output_root, photo.product, stem)
             if ws.exists():
                 shutil.rmtree(ws, ignore_errors=True)
                 cleaned += 1
     photo.variants = []  # type: ignore[possibly-undefined]
-    M.save(manifest)
+    M.save(manifest, st)
     return cleaned
 
 
@@ -214,16 +235,17 @@ def classify_photo(
     """
     if photo.classification is not None:
         return
+    st = get_storage(cfg)
     preset = manifest.product_classifications.get(photo.product)
     if preset:
         photo.classification = preset
-        M.save(manifest)
+        M.save(manifest, st)
         return
-    res = anthropic_client.classify(Path(photo.input_path))
+    res = anthropic_client.classify(Path(st.materialize(photo.input_path)))
     photo.classification = res.text
     photo.cost_usd += res.cost_usd
     manifest.total_cost_usd += res.cost_usd
-    M.save(manifest)
+    M.save(manifest, st)
 
 
 def generate_prompt_for(
@@ -234,6 +256,7 @@ def generate_prompt_for(
 ) -> None:
     if photo.prompt:
         return
+    st = get_storage(cfg)
     if photo.classification is None:
         classify_photo(cfg, manifest, photo, anthropic_client)
     classification = photo.classification or "packshot"
@@ -243,7 +266,7 @@ def generate_prompt_for(
     # Per-product description (set at project creation), prepended to the brief.
     product_description = manifest.product_briefs.get(photo.product, "")
     res = anthropic_client.generate_prompt(
-        Path(photo.input_path),
+        Path(st.materialize(photo.input_path)),
         classification=classification,
         refs=refs,
         brief_notes=photo.brief_notes or "",
@@ -264,7 +287,7 @@ def generate_prompt_for(
             # Clear any previous truncation warning on successful clean output
             if photo.last_error and "truncated" in photo.last_error:
                 photo.last_error = None
-        M.save(manifest)
+        M.save(manifest, st)
 
 
 def generate_variants_for(
@@ -278,17 +301,20 @@ def generate_variants_for(
     """Run Gemini batch. Writes N images to workspace, sets photo.variants, clears selection."""
     if not photo.prompt:
         raise RuntimeError(f"Cannot generate variants for {photo.photo_id}: prompt is empty")
+    st = get_storage(cfg)
     n = n or cfg.default_n
     n = max(1, min(n, cfg.max_n))
 
-    output_root = Path(manifest.output_root)
     stem = Path(photo.input_path).stem
-    ws = workspace_dir(output_root, photo.product, stem)
+    ws = workspace_dir(manifest.output_root, photo.product, stem)
     if ws.exists():
         shutil.rmtree(ws, ignore_errors=True)
     ws.mkdir(parents=True, exist_ok=True)
 
-    input_ref = reference_override if reference_override else Path(photo.input_path)
+    # Gemini needs a real local file. reference_override may be a local workspace path
+    # (already real) or a storage path; materialize handles both (no-op for local).
+    raw_ref = str(reference_override) if reference_override else photo.input_path
+    input_ref = Path(st.materialize(raw_ref))
     # Same logic as in generate_prompt_for: refs only feed into Gemini for worn shots.
     additional = (
         cfg.get_product_refs_ordered(photo.product)
@@ -321,7 +347,7 @@ def generate_variants_for(
         photo.cost_usd += batch.cost_usd
         photo.last_error = "; ".join(batch.errors) if batch.errors else None
         manifest.total_cost_usd += batch.cost_usd
-        M.save(manifest)
+        M.save(manifest, st)
 
 
 def submit_regenerate(
@@ -350,7 +376,7 @@ def submit_regenerate(
         except Exception as e:
             with _MANIFEST_LOCK:
                 photo.last_error = str(e)
-                M.save(manifest)
+                M.save(manifest, get_storage(cfg))
             raise
 
     return _get_executor().submit(_task)
@@ -379,13 +405,13 @@ def submit_generate_prompt(
         except Exception as e:
             with _MANIFEST_LOCK:
                 photo.last_error = str(e)
-                M.save(manifest)
+                M.save(manifest, get_storage(cfg))
             raise
 
     return _get_prompt_executor().submit(_task)
 
 
-def hero_path_for_photo(manifest: M.Manifest, photo: M.PhotoState) -> Optional[str]:
+def hero_path_for_photo(cfg: Config, manifest: M.Manifest, photo: M.PhotoState) -> Optional[str]:
     """Resolve the grading reference for a photo.
 
     Priority:
@@ -393,10 +419,11 @@ def hero_path_for_photo(manifest: M.Manifest, photo: M.PhotoState) -> Optional[s
       2. Project-wide default (`manifest.hero_path`)
       3. None (grading runs background-only)
     """
+    st = get_storage(cfg)
     per_product = manifest.product_heroes.get(photo.product)
-    if per_product and Path(per_product).exists():
+    if per_product and st.exists(per_product):
         return per_product
-    if manifest.hero_path and Path(manifest.hero_path).exists():
+    if manifest.hero_path and st.exists(manifest.hero_path):
         return manifest.hero_path
     return None
 
@@ -415,24 +442,24 @@ def select_variant(
     if variant_path not in photo.variants:
         raise ValueError(f"variant_path {variant_path} not in current variants for {photo.photo_id}")
 
+    st = get_storage(cfg)
+    # Variants live on local scratch — read directly.
     src_bytes = Path(variant_path).read_bytes()
 
     hero_rgb = None
-    hero_resolved = hero_path_for_photo(manifest, photo)
+    hero_resolved = hero_path_for_photo(cfg, manifest, photo)
     if hero_resolved:
         import numpy as np
         from PIL import Image as _PI
-        hero_img = _PI.open(hero_resolved).convert("RGB")
+        hero_img = _PI.open(st.materialize(hero_resolved)).convert("RGB")
         hero_rgb = np.array(hero_img)
 
     graded = grade_image(src_bytes, photo.classification or "packshot", hero_rgb=hero_rgb)
-    out = Path(photo.output_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(graded)
+    st.write_bytes(photo.output_path, graded)
 
     photo.selected_variant = variant_path
     photo.graded = True
-    M.save(manifest)
+    M.save(manifest, st)
 
 
 def submit_grade(
@@ -450,7 +477,7 @@ def submit_grade(
         except Exception as e:
             with _MANIFEST_LOCK:
                 photo.last_error = f"Grading failed: {e}"
-                M.save(manifest)
+                M.save(manifest, get_storage(cfg))
             raise
 
     return _get_grade_executor().submit(_task)
@@ -510,4 +537,4 @@ def process_pending(
             generate_variants_for(cfg, manifest, photo, gemini_client, n=n)
         except Exception as e:
             photo.last_error = str(e)
-            M.save(manifest)
+            M.save(manifest, get_storage(cfg))

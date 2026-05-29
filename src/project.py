@@ -17,14 +17,14 @@ and locked in — so classification is folder-name driven, no Claude vision call
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
-import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from .config import Config
+from .storage import Storage, get_storage
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
@@ -113,28 +113,33 @@ class Project:
 
 # ─── Discovery ────────────────────────────────────────────────────────────
 
-def discover_product_groups(brand_root: Path) -> list[ProductGroup]:
+def discover_product_groups(cfg: Config, brand_root: str) -> list[ProductGroup]:
     """
     Walk the brand folder and produce one ProductGroup per subfolder that contains
     images. The description is left blank — the user fills these in during the
     "Create new project" wizard.
 
-    Folder order: alphabetical (sorted). Numbered prefixes like "01_", "02_" sort
-    naturally, which matches how the user organizes them.
+    Folder order: sorted by the storage backend. Numbered prefixes like "01_", "02_"
+    sort naturally, which matches how the user organizes them.
     """
+    st = get_storage(cfg)
     out: list[ProductGroup] = []
-    if not brand_root.exists() or not brand_root.is_dir():
+    if not st.exists(brand_root) or not st.is_dir(brand_root):
         return out
-    for sub in sorted(p for p in brand_root.iterdir() if p.is_dir()):
+    for sub in st.list_subdirs(brand_root):
         # Count images directly inside (one level deep — match pipeline.discover_images)
-        n = sum(1 for f in sub.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTS)
+        n = sum(
+            1 for f in st.list_files(sub)
+            if Path(st.name(f)).suffix.lower() in IMAGE_EXTS
+        )
         if n == 0:
             continue
+        name = st.name(sub)
         out.append(
             ProductGroup(
-                folder_name=sub.name,
+                folder_name=name,
                 description="",
-                is_worn=is_worn_folder(sub.name),
+                is_worn=is_worn_folder(name),
                 n_images=n,
             )
         )
@@ -143,78 +148,42 @@ def discover_product_groups(brand_root: Path) -> list[ProductGroup]:
 
 # ─── Persistence ──────────────────────────────────────────────────────────
 
-def _projects_dir() -> Path:
-    # Lives in _auto_pipeline/projects/ next to the package.
+def _projects_root(cfg: Config) -> str:
+    """Where project JSONs live: the configured Dropbox dir on the cloud backend,
+    else the local _auto_pipeline/projects/ folder next to the package."""
+    st = get_storage(cfg)
+    if getattr(st, "backend", "local") == "dropbox" and cfg.dropbox_projects_dir:
+        return cfg.dropbox_projects_dir
     d = Path(__file__).resolve().parent.parent / "projects"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return str(d)
 
 
-def project_path(slug: str) -> Path:
-    return _projects_dir() / f"{slug}.json"
+def project_path(cfg: Config, slug: str) -> str:
+    st = get_storage(cfg)
+    return st.join(_projects_root(cfg), f"{slug}.json")
 
 
-def _atomic_write(path: Path, payload: str) -> None:
-    """tmp + rename with retries — same hardening as manifest.py for Dropbox/AV locks."""
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    last_exc: Optional[BaseException] = None
-    for attempt in range(5):
-        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".project_", suffix=".json", dir=str(parent))
-        try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-            os.replace(tmp_path, path)
-            return
-        except OSError as e:
-            last_exc = e
-            try:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except OSError:
-                pass
-            time.sleep(0.1 * (2 ** attempt))
-        except Exception:
-            try:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    # Last resort: direct write
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(payload)
-    if last_exc is not None:
-        # We recovered, but flag it once on stderr so the user sees it in the terminal
-        import sys
-        print(f"[project] atomic write retried, fell back to direct write: {last_exc}", file=sys.stderr)
-
-
-def save_project(project: Project) -> Path:
+def save_project(cfg: Config, project: Project) -> str:
     project.updated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     if not project.created_at:
         project.created_at = project.updated_at
-    target = project_path(project.slug)
-    _atomic_write(target, project.to_json())
+    st = get_storage(cfg)
+    target = project_path(cfg, project.slug)
+    st.write_text(target, project.to_json())
     return target
 
 
-def load_project(slug: str) -> Optional[Project]:
-    p = project_path(slug)
-    if not p.exists():
+def load_project(cfg: Config, slug: str) -> Optional[Project]:
+    st = get_storage(cfg)
+    p = project_path(cfg, slug)
+    if not st.exists(p):
         return None
-    return Project.from_json(p.read_text(encoding="utf-8"))
+    return Project.from_json(st.read_text(p))
 
 
-def delete_project(slug: str) -> bool:
-    p = project_path(slug)
-    if p.exists():
-        try:
-            p.unlink()
-            return True
-        except OSError:
-            return False
-    return False
+def delete_project(cfg: Config, slug: str) -> bool:
+    st = get_storage(cfg)
+    return st.delete(project_path(cfg, slug))
 
 
 @dataclass
@@ -227,17 +196,22 @@ class ProjectSummary:
     updated_at: str
 
 
-def list_projects() -> list[ProjectSummary]:
+def list_projects(cfg: Config) -> list[ProjectSummary]:
     """All saved projects, newest-updated first."""
-    d = _projects_dir()
+    st = get_storage(cfg)
+    root = _projects_root(cfg)
     out: list[ProjectSummary] = []
-    for f in d.glob("*.json"):
+    if not st.exists(root):
+        return out
+    for f in st.list_files(root):
+        if not st.name(f).endswith(".json"):
+            continue
         try:
-            obj = json.loads(f.read_text(encoding="utf-8"))
+            obj = json.loads(st.read_text(f))
             out.append(
                 ProjectSummary(
-                    slug=f.stem,
-                    name=obj.get("name", f.stem),
+                    slug=st.stem(f),
+                    name=obj.get("name", st.stem(f)),
                     brand_root=obj.get("brand_root", ""),
                     output_root=obj.get("output_root", ""),
                     n_products=len(obj.get("products", [])),

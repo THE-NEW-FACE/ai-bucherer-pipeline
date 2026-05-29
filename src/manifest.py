@@ -1,14 +1,16 @@
-"""Manifest = the on-disk state for one output root. JSON, atomic writes, resumable."""
+"""Manifest = the persisted state for one output root. JSON, resumable.
+
+Reads/writes go through a Storage backend (local disk or Dropbox), so the same
+manifest logic works on the desktop and on the cloud deploy."""
 
 from __future__ import annotations
 
 import json
-import os
-import tempfile
-import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Literal, Optional
+
+from .storage import Storage
 
 Classification = Literal["packshot", "worn"]
 
@@ -86,61 +88,18 @@ class Manifest:
         )
 
 
-def manifest_path(output_root: Path) -> Path:
-    return output_root / ".pipeline_manifest.json"
+def manifest_path(storage: Storage, output_root: str) -> str:
+    return storage.join(output_root, ".pipeline_manifest.json")
 
 
-def _try_unlink(p: str) -> None:
-    try:
-        if os.path.exists(p):
-            os.unlink(p)
-    except OSError:
-        # Best-effort cleanup; another process (Dropbox, antivirus) may still hold it.
-        pass
+def save(manifest: Manifest, storage: Storage) -> None:
+    """Persist the manifest JSON beside the output root (atomicity handled by the backend)."""
+    target = manifest_path(storage, manifest.output_root)
+    storage.write_text(target, manifest.to_json())
 
 
-def save(manifest: Manifest) -> None:
-    """Atomic write: tmp + rename, with retries for Dropbox/AV/OneDrive locks on Windows."""
-    out = Path(manifest.output_root)
-    out.mkdir(parents=True, exist_ok=True)
-    target = manifest_path(out)
-    payload = manifest.to_json()
-
-    # Try atomic tmp+rename a few times — Dropbox sync, antivirus, or OneDrive
-    # often grab a brief read lock the moment the temp file appears, causing
-    # os.replace to fail with WinError 5 (Access denied) or WinError 32 (file in use).
-    last_exc: Optional[BaseException] = None
-    for attempt in range(5):
-        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".manifest_", suffix=".json", dir=str(out))
-        try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-            os.replace(tmp_path, target)
-            return
-        except OSError as e:
-            last_exc = e
-            _try_unlink(tmp_path)
-            # Exponential backoff: 0.1s, 0.2s, 0.4s, 0.8s, 1.6s
-            time.sleep(0.1 * (2 ** attempt))
-        except Exception:
-            _try_unlink(tmp_path)
-            raise
-
-    # Last resort: write directly to the target. Not atomic, but a corrupted
-    # manifest is still better than losing the entire session's state.
-    try:
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(payload)
-    except OSError as e:
-        raise OSError(
-            f"Could not save manifest to {target}. Last atomic-write error: {last_exc}. "
-            f"Direct write also failed: {e}. "
-            f"If the output folder is in Dropbox/OneDrive, try pausing sync or moving the output root outside the sync folder."
-        ) from e
-
-
-def load(output_root: Path) -> Optional[Manifest]:
-    p = manifest_path(output_root)
-    if not p.exists():
+def load(output_root: str, storage: Storage) -> Optional[Manifest]:
+    p = manifest_path(storage, output_root)
+    if not storage.exists(p):
         return None
-    return Manifest.from_json(p.read_text(encoding="utf-8"))
+    return Manifest.from_json(storage.read_text(p))

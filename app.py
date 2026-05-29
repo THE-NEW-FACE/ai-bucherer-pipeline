@@ -33,6 +33,7 @@ from src.anthropic_client import AnthropicClient  # noqa: E402
 from src.config import load_config  # noqa: E402
 from src.gemini_client import GeminiClient  # noqa: E402
 from src import pipeline as P  # noqa: E402
+from src.storage import get_storage  # noqa: E402
 
 
 # ═══ Page setup ══════════════════════════════════════════════════════════
@@ -550,6 +551,38 @@ st.markdown(
 # ═══ Config + clients ════════════════════════════════════════════════════
 
 cfg = load_config()
+ST = get_storage(cfg)
+
+
+# ── Storage bridges for the UI ───────────────────────────────────────────
+# Paths in the manifest fall into two classes:
+#   • Storage paths   — source renders, graded outputs, heroes (local disk OR Dropbox)
+#   • Local scratch   — Gemini variants (always a real local temp file, even on the
+#                       Dropbox backend; see pipeline._workspace_base)
+# These helpers resolve either kind to something PIL / st.image can open, and answer
+# existence, without the caller needing to know which backend or class a path is.
+
+def _local(path) -> Path:
+    """Return a real local file for `path`. Local scratch files are returned as-is;
+    Storage paths are materialized (downloaded + cached for the Dropbox backend)."""
+    p = str(path)
+    if Path(p).exists():
+        return Path(p)
+    try:
+        return Path(ST.materialize(p))
+    except Exception:
+        return Path(p)
+
+
+def _path_exists(path) -> bool:
+    """Existence check that works for both local scratch and Storage paths."""
+    p = str(path)
+    if Path(p).exists():
+        return True
+    try:
+        return ST.exists(p)
+    except Exception:
+        return False
 
 
 @st.cache_resource(show_spinner=False)
@@ -574,14 +607,52 @@ def current_route() -> str:
     return st.session_state.get("route", "landing")
 
 
+# ═══ Access gate (shared password for the public deploy) ═════════════════
+
+def require_password() -> None:
+    """Gate the whole app behind a shared password when APP_PASSWORD is configured.
+
+    No password set (local dev / desktop) → no gate. Otherwise the rest of the page
+    is withheld (st.stop) until the user enters the correct password once per session.
+    Comparison is constant-time to avoid leaking length/prefix via timing.
+    """
+    if not cfg.app_password:
+        return
+    if st.session_state.get("_authed"):
+        return
+
+    import hmac
+
+    _l, mid, _r = st.columns([1, 1.4, 1])
+    with mid:
+        st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div style='font-size:22px;font-weight:600;'>AI Bucherer</div>"
+            "<div class='subtle' style='font-size:13px;margin-bottom:16px;'>"
+            "Enter the access password to continue.</div>",
+            unsafe_allow_html=True,
+        )
+        with st.form("login", clear_on_submit=False):
+            pw = st.text_input("Password", type="password", label_visibility="collapsed",
+                               placeholder="Password")
+            ok = st.form_submit_button("Unlock", type="primary", use_container_width=True)
+        if ok:
+            if hmac.compare_digest(pw, cfg.app_password):
+                st.session_state["_authed"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    st.stop()
+
+
 # ═══ Helpers (dialogs, thumbnails, compliance) ═══════════════════════════
 
 @st.dialog("Full-size view", width="large")
 def _show_fullscreen(image_path: str, caption: str = ""):
-    p = Path(image_path)
-    if not p.exists():
-        st.error(f"File not found: {p}")
+    if not _path_exists(image_path):
+        st.error(f"File not found: {image_path}")
         return
+    p = _local(image_path)
     img = Image.open(p)
     if caption:
         st.markdown(f"**{caption}**")
@@ -589,7 +660,7 @@ def _show_fullscreen(image_path: str, caption: str = ""):
         st.image(img, use_container_width=True)
     except TypeError:
         st.image(img, width="stretch")
-    st.caption(f"{img.size[0]}×{img.size[1]} px · {p.stat().st_size // 1024} KB · `{p}`")
+    st.caption(f"{img.size[0]}×{img.size[1]} px · {p.stat().st_size // 1024} KB")
 
 
 @st.dialog("Before / After", width="large")
@@ -607,23 +678,23 @@ def _show_comparison(
     reuses the same cached data-URL pipeline as the board, so opening this dialog
     is near-instant — the cached JPEGs are already in memory.
     """
-    bp, ap = Path(before_path), Path(after_path)
-    if not bp.exists() or not ap.exists():
-        st.error(f"Missing image(s):\nbefore: {bp}\nafter: {ap}")
+    if not _path_exists(before_path) or not _path_exists(after_path):
+        st.error(f"Missing image(s):\nbefore: {before_path}\nafter: {after_path}")
         return
     if title:
         st.markdown(f"**{title}**")
 
     from streamlit.components.v1 import html as st_html
-    # Larger max_edge for the modal (still 1280 — full-res 2K is overkill here)
+    # Larger max_edge for the modal (still 1280 — full-res 2K is overkill here).
+    # render_hover_card_html materializes Storage paths internally.
     html_payload = render_hover_card_html(
-        str(bp), str(ap), height_px=560, max_edge=1280,
+        str(before_path), str(after_path), height_px=560, max_edge=1280,
     )
     st_html(html_payload, height=576, scrolling=False)
 
     # Footer caption — pull real dimensions from disk header only (cheap)
     try:
-        with Image.open(bp) as ib, Image.open(ap) as ia:
+        with Image.open(_local(before_path)) as ib, Image.open(_local(after_path)) as ia:
             bw, bh = ib.size
             aw, ah = ia.size
         st.caption(
@@ -693,20 +764,20 @@ def thumb(
     fs_key: str | None = None,
     fs_caption: str | None = None,
 ):
-    p = Path(image_path)
-    if not p.exists():
-        st.caption(f"_(missing: {p.name})_")
+    name = Path(str(image_path)).name
+    if not _path_exists(image_path):
+        st.caption(f"_(missing: {name})_")
         return
     try:
-        img = Image.open(p)
+        img = Image.open(_local(image_path))
         st.image(img, width=width, caption=caption)
     except Exception as e:
-        st.caption(f"_(can't open {p.name}: {e})_")
+        st.caption(f"_(can't open {name}: {e})_")
         return
     if fs_key:
         if st.button("🔍 Full size", key=fs_key, use_container_width=True,
                      help="Open in lightbox at near-viewport resolution"):
-            _show_fullscreen(str(p), fs_caption or caption or p.name)
+            _show_fullscreen(str(image_path), fs_caption or caption or name)
 
 
 # ═══ Hover-slider component (board cards) ════════════════════════════════
@@ -740,16 +811,29 @@ def _cached_data_url(path_str: str, mtime: float, max_edge: int) -> str:
         )
 
 
-def _image_to_data_url(path: Path, max_edge: int = 900) -> str:
-    """Public wrapper — picks up mtime so the cache invalidates on file rewrite."""
+def _image_to_data_url(path, max_edge: int = 900) -> str:
+    """Public wrapper — materializes the path to a local file (no-op for local scratch /
+    local backend), then keys the cache on mtime so it invalidates on file rewrite."""
+    local = _local(path)
     try:
-        mtime = Path(path).stat().st_mtime
+        mtime = local.stat().st_mtime
     except OSError:
         mtime = 0.0
-    return _cached_data_url(str(path), mtime, max_edge)
+    return _cached_data_url(str(local), mtime, max_edge)
 
 
-def _render_wizard_thumb_strip(folder_path: Path, total_images: int) -> None:
+def _folder_images(folder: str) -> list[str]:
+    """Image paths (Storage paths) directly inside `folder`, sorted. Works on both
+    the local and Dropbox backends."""
+    if not ST.exists(folder):
+        return []
+    return [
+        f for f in ST.list_files(folder)
+        if Path(ST.name(f)).suffix.lower() in PROJ.IMAGE_EXTS
+    ]
+
+
+def _render_wizard_thumb_strip(folder: str, total_images: int) -> None:
     """Inline horizontal thumbnails for the project-creation wizard so the user
     can actually see what they're describing. Pure HTML — uses the cached data-URL
     pipeline, so each thumbnail is computed once and reused across all reruns.
@@ -758,27 +842,19 @@ def _render_wizard_thumb_strip(folder_path: Path, total_images: int) -> None:
     small caption flags the count. A separate "🔍 View all" button sits below the
     strip so the user can pop the full set into the lightbox for closer inspection.
     """
-    if not folder_path.exists():
-        st.caption("_(folder missing)_")
-        return
-
-    all_imgs = sorted(
-        p for p in folder_path.iterdir()
-        if p.is_file() and p.suffix.lower() in PROJ.IMAGE_EXTS
-    )
+    all_imgs = _folder_images(folder)
     if not all_imgs:
         st.caption("_(no images)_")
         return
 
-    thumbs = all_imgs[:4]
     parts = ['<div style="display:flex;gap:6px;margin:6px 0 6px 0;flex-wrap:wrap;">']
-    for p in thumbs:
+    for p in all_imgs[:4]:
         url = _image_to_data_url(p, max_edge=240)
         parts.append(
             f'<img src="{url}" '
             f'style="width:108px;height:108px;object-fit:cover;border-radius:4px;'
             f'border:1px solid rgba(255,255,255,0.18);background:#1a1a1a;" '
-            f'title="{p.name}"/>'
+            f'title="{ST.name(p)}"/>'
         )
     parts.append("</div>")
     st.markdown("".join(parts), unsafe_allow_html=True)
@@ -788,25 +864,19 @@ def _render_wizard_thumb_strip(folder_path: Path, total_images: int) -> None:
         with zc1:
             st.caption(f"+{total_images - 4} more in this folder")
         with zc2:
-            if st.button("🔍 View all", key=f"wiz_zoom_{folder_path.name}",
+            if st.button("🔍 View all", key=f"wiz_zoom_{ST.name(folder)}",
                          use_container_width=True,
                          help="Open every image in this folder at full size"):
-                _show_folder_gallery(folder_path)
+                _show_folder_gallery(folder)
 
 
 @st.dialog("Folder gallery", width="large")
-def _show_folder_gallery(folder_path: Path):
+def _show_folder_gallery(folder: str):
     """All images in a folder, shown at a comfortable QC size. Used by the wizard
     so the user can inspect everything in archive/dense folders before writing a
     description, without leaving the app."""
-    if not folder_path.exists():
-        st.error(f"Folder gone: {folder_path}")
-        return
-    imgs = sorted(
-        p for p in folder_path.iterdir()
-        if p.is_file() and p.suffix.lower() in PROJ.IMAGE_EXTS
-    )
-    st.markdown(f"**{folder_path.name}** · {len(imgs)} images")
+    imgs = _folder_images(folder)
+    st.markdown(f"**{ST.name(folder)}** · {len(imgs)} images")
     if not imgs:
         st.caption("_(empty)_")
         return
@@ -814,13 +884,14 @@ def _show_folder_gallery(folder_path: Path):
     parts = ['<div style="display:flex;gap:8px;flex-wrap:wrap;">']
     for p in imgs:
         url = _image_to_data_url(p, max_edge=380)
+        nm = ST.name(p)
         parts.append(
             f'<div style="text-align:center;">'
             f'<img src="{url}" '
             f'style="width:200px;height:200px;object-fit:cover;border-radius:4px;'
             f'border:1px solid rgba(255,255,255,0.18);background:#1a1a1a;display:block;" '
-            f'title="{p.name}"/>'
-            f'<div style="font-size:11px;color:#888;margin-top:2px;">{p.name}</div>'
+            f'title="{nm}"/>'
+            f'<div style="font-size:11px;color:#888;margin-top:2px;">{nm}</div>'
             f'</div>'
         )
     parts.append("</div>")
@@ -839,8 +910,8 @@ def render_hover_card_html(
     If overlay_path is None, only the input image is shown.
     `max_edge` caps the encoded JPEG's long edge — board uses 900, dialog uses 1280.
     """
-    input_url = _image_to_data_url(Path(input_path), max_edge=max_edge)
-    overlay_url = _image_to_data_url(Path(overlay_path), max_edge=max_edge) if overlay_path else None
+    input_url = _image_to_data_url(input_path, max_edge=max_edge)
+    overlay_url = _image_to_data_url(overlay_path, max_edge=max_edge) if overlay_path else None
 
     overlay_html = ""
     if overlay_url:
@@ -944,9 +1015,7 @@ _init_session_state()
 
 
 def _load_manifest_for_project(project: PROJ.Project) -> M.Manifest:
-    brand = Path(project.brand_root)
-    output = Path(project.output_root)
-    return P.ingest(cfg, brand, output, project=project)
+    return P.ingest(cfg, project.brand_root, project.output_root, project=project)
 
 
 def _close_project():
@@ -1114,26 +1183,24 @@ def render_sidebar():
             if hero_upload is not None and st.button(
                 "📌 Set as hero", key="set_hero_btn", use_container_width=True,
             ):
-                hero_dir = Path(manifest.output_root) / ".hero"
-                hero_dir.mkdir(parents=True, exist_ok=True)
-                hero_target = hero_dir / hero_upload.name
-                hero_target.write_bytes(hero_upload.getvalue())
-                manifest.hero_path = str(hero_target)
+                hero_target = ST.join(manifest.output_root, ".hero", hero_upload.name)
+                ST.write_bytes(hero_target, hero_upload.getvalue())
+                manifest.hero_path = hero_target
                 manifest.hero_photo_id = None
-                M.save(manifest)
+                M.save(manifest, ST)
                 st.success(f"Hero set to {hero_upload.name}")
                 st.rerun()
 
             if manifest.hero_path:
-                hp = Path(manifest.hero_path)
-                if hp.exists():
-                    st.image(str(hp), width=200, caption=f"Hero: {hp.name}")
+                if _path_exists(manifest.hero_path):
+                    hero_name = ST.name(manifest.hero_path)
+                    st.image(str(_local(manifest.hero_path)), width=200, caption=f"Hero: {hero_name}")
                     hc1, hc2 = st.columns(2)
                     with hc1:
                         if st.button("Clear", key="clear_hero_btn", use_container_width=True):
                             manifest.hero_path = None
                             manifest.hero_photo_id = None
-                            M.save(manifest)
+                            M.save(manifest, ST)
                             st.rerun()
                     with hc2:
                         if st.button("Re-grade all", key="regrade_all_btn", use_container_width=True,
@@ -1142,7 +1209,7 @@ def render_sidebar():
                             st.success(f"Re-graded {n} photo(s).")
                             st.rerun()
                 else:
-                    st.warning(f"Hero file missing: {hp}")
+                    st.warning(f"Hero file missing: {manifest.hero_path}")
             else:
                 st.warning("No hero set — grading is background-only.")
 
@@ -1167,10 +1234,10 @@ def render_sidebar():
                         pg.description = new_desc
                         changed = True
                 if changed:
-                    PROJ.save_project(project)
+                    PROJ.save_project(cfg, project)
                     if manifest:
                         manifest.product_briefs = project.product_brief_map()
-                        M.save(manifest)
+                        M.save(manifest, ST)
                     st.toast("Saved.", icon="💾")
 
             with st.expander("Per-product hero overrides", expanded=False):
@@ -1184,7 +1251,7 @@ def render_sidebar():
                 else:
                     for pg in project.products:
                         current_path = manifest.product_heroes.get(pg.folder_name)
-                        current_ok = bool(current_path and Path(current_path).exists())
+                        current_ok = bool(current_path and _path_exists(current_path))
                         # Per-product card
                         st.markdown(
                             f"<div style='font-size:12px;font-weight:600;color:var(--text);"
@@ -1195,12 +1262,12 @@ def render_sidebar():
                             ph1, ph2 = st.columns([2, 1])
                             with ph1:
                                 # Thumbnail of the current override
-                                url = _image_to_data_url(Path(current_path), max_edge=160)
+                                url = _image_to_data_url(current_path, max_edge=160)
                                 st.markdown(
                                     f"<img src='{url}' style='width:100%;max-width:160px;"
                                     f"aspect-ratio:1/1;object-fit:cover;border-radius:6px;"
                                     f"border:1px solid var(--border-subtle);' "
-                                    f"title='{Path(current_path).name}'/>",
+                                    f"title='{ST.name(current_path)}'/>",
                                     unsafe_allow_html=True,
                                 )
                             with ph2:
@@ -1208,7 +1275,7 @@ def render_sidebar():
                                              use_container_width=True,
                                              help="Fall back to the project-wide hero"):
                                     manifest.product_heroes.pop(pg.folder_name, None)
-                                    M.save(manifest)
+                                    M.save(manifest, ST)
                                     st.rerun()
                         else:
                             st.markdown(
@@ -1226,12 +1293,10 @@ def render_sidebar():
                             "Set as override", key=f"setoverhero_{pg.folder_name}",
                             use_container_width=True,
                         ):
-                            heroes_dir = Path(manifest.output_root) / ".hero" / pg.folder_name
-                            heroes_dir.mkdir(parents=True, exist_ok=True)
-                            target = heroes_dir / up.name
-                            target.write_bytes(up.getvalue())
-                            manifest.product_heroes[pg.folder_name] = str(target)
-                            M.save(manifest)
+                            target = ST.join(manifest.output_root, ".hero", pg.folder_name, up.name)
+                            ST.write_bytes(target, up.getvalue())
+                            manifest.product_heroes[pg.folder_name] = target
+                            M.save(manifest, ST)
                             st.toast(f"Hero set for {pg.folder_name}", icon="📌")
                             st.rerun()
 
@@ -1283,7 +1348,7 @@ def render_landing_page():
     st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
     st.markdown("#### Projects")
 
-    projects = PROJ.list_projects()
+    projects = PROJ.list_projects(cfg)
     if not projects:
         empty = st.container(border=True)
         with empty:
@@ -1323,7 +1388,7 @@ def render_landing_page():
                 if st.button("Open →", key=f"open_{s.slug}",
                              type="primary",
                              use_container_width=True):
-                    proj = PROJ.load_project(s.slug)
+                    proj = PROJ.load_project(cfg, s.slug)
                     if not proj:
                         st.error("Failed to load project.")
                     else:
@@ -1336,7 +1401,7 @@ def render_landing_page():
             with tc3:
                 if st.button("🗑", key=f"del_{s.slug}", use_container_width=True,
                              help="Delete project metadata (does not touch your images)"):
-                    PROJ.delete_project(s.slug)
+                    PROJ.delete_project(cfg, s.slug)
                     st.rerun()
 
 
@@ -1351,29 +1416,30 @@ def render_create_project_page():
 
     st.markdown("##### 1) Choose folders")
 
+    _dropbox = getattr(ST, "backend", "local") == "dropbox"
     brand_text = st.text_input(
         "Brand folder (contains one subfolder per product)",
         value=st.session_state.get("wiz_brand", ""),
-        placeholder=r"C:\path\to\Bucherer",
+        placeholder="/THENEWFACE/02_PROJECTS/…/Bucherer" if _dropbox else r"C:\path\to\Bucherer",
         key="wiz_brand",
     )
-    brand_path: Path | None = Path(brand_text) if brand_text.strip() else None
-    brand_valid = bool(brand_path and brand_path.exists() and brand_path.is_dir())
-    if brand_text.strip() and not brand_valid:
-        st.warning(f"Folder doesn't exist: {brand_path}")
+    brand_root = brand_text.strip()
+    brand_valid = bool(brand_root and ST.exists(brand_root) and ST.is_dir(brand_root))
+    if brand_root and not brand_valid:
+        st.warning(f"Folder doesn't exist: {brand_root}")
 
     default_output = ""
     if brand_valid:
-        default_output = str(P.default_output_root(cfg, brand_path))
+        default_output = P.default_output_root(cfg, brand_root)
     output_text = st.text_input(
         "Output folder",
         value=st.session_state.get("wiz_output", default_output),
         placeholder="auto: <brand>_OUT",
         key="wiz_output",
     )
-    output_path: Path | None = Path(output_text) if output_text.strip() else None
+    output_root_text = output_text.strip()
 
-    name_default = brand_path.name if brand_valid else ""
+    name_default = ST.name(brand_root) if brand_valid else ""
     name = st.text_input(
         "Project name",
         value=st.session_state.get("wiz_name", name_default),
@@ -1386,10 +1452,10 @@ def render_create_project_page():
         return
 
     # Discover products on the fly
-    discovered = PROJ.discover_product_groups(brand_path)
+    discovered = PROJ.discover_product_groups(cfg, brand_root)
     if not discovered:
         st.error(
-            f"No image-containing subfolders found in `{brand_path}`. Expected layout:\n\n"
+            f"No image-containing subfolders found in `{brand_root}`. Expected layout:\n\n"
             "```\nBrand/\n  01_Product/\n    img1.png\n    img2.png\n  01_worn/\n    ...\n```"
         )
         return
@@ -1421,7 +1487,7 @@ def render_create_project_page():
                 )
                 # Thumbnails so the user can actually see what they're describing.
                 # Uses cached data URLs — instant after first load, free on reruns.
-                _render_wizard_thumb_strip(brand_path / pg.folder_name, pg.n_images)
+                _render_wizard_thumb_strip(ST.join(brand_root, pg.folder_name), pg.n_images)
                 st.text_input(
                     "Product description",
                     key=f"wiz_desc_{pg.folder_name}",
@@ -1457,18 +1523,18 @@ def render_create_project_page():
             disabled=not can_create, use_container_width=True,
         ):
             # Build Project
-            out = output_path or P.default_output_root(cfg, brand_path)
+            out = output_root_text or P.default_output_root(cfg, brand_root)
             products = []
             for pg in discovered:
                 pg.description = st.session_state.get(f"wiz_desc_{pg.folder_name}", "").strip()
                 products.append(pg)
             proj = PROJ.Project(
                 name=name.strip(),
-                brand_root=str(brand_path),
-                output_root=str(out),
+                brand_root=brand_root,
+                output_root=out,
                 products=products,
             )
-            PROJ.save_project(proj)
+            PROJ.save_project(cfg, proj)
             mf = _load_manifest_for_project(proj)
 
             st.session_state["project"] = proj
@@ -1632,15 +1698,17 @@ def render_board_card(photo: M.PhotoState):
     # dies. The input-vs-output compare slider lives in the detail view, where a
     # single component instance is safe. The keyed container lets the CSS below
     # force a square 1:1 thumbnail.
-    if photo.graded and Path(photo.output_path).exists():
+    # `photo.graded` is the manifest's own truth that the output was written — trust
+    # it instead of a per-card filesystem/API existence probe (cheap on the board grid).
+    if photo.graded:
         display_img = photo.output_path
-    elif overlay_path and Path(overlay_path).exists():
+    elif overlay_path and _path_exists(overlay_path):
         display_img = overlay_path
     else:
         display_img = photo.input_path
 
     with st.container(key=f"boardimg-{photo.photo_id}"):
-        st.image(display_img, use_container_width=True)
+        st.image(str(_local(display_img)), use_container_width=True)
 
     # ── 2) Control row — clean toolbar inspired by the Gemini variant card:
     #     ‹  1 / 4  ›        ⤢
@@ -1859,7 +1927,7 @@ def render_board_page():
         cls_class = "badge-worn" if is_worn else "badge-packshot"
         # Per-product hero override flag (small indicator → product uses its own hero, not project default)
         has_override = bool(manifest.product_heroes.get(product_name)
-                            and Path(manifest.product_heroes[product_name]).exists())
+                            and _path_exists(manifest.product_heroes[product_name]))
         hero_badge = (
             "<span class='badge' style='background:var(--accent-muted);color:var(--accent);"
             "border-color:rgba(212,168,87,0.28);' "
@@ -1951,7 +2019,6 @@ def render_photo_card(photo: M.PhotoState):
         del grade_pending[photo.photo_id]
     is_grading = (gfut is not None) and not gfut.done()
 
-    output_root = Path(manifest.output_root)
     stem = Path(photo.input_path).stem
 
     view_mode = st.session_state.get("detail_view_mode", "Side by side")
@@ -1977,7 +2044,7 @@ def render_photo_card(photo: M.PhotoState):
             if new_class != current_class:
                 photo.classification = new_class
                 photo.user_overrode_classification = True
-                M.save(manifest)
+                M.save(manifest, ST)
         with h3:
             if is_grading:
                 st.markdown("<span class='badge badge-running'>● Grading…</span>", unsafe_allow_html=True)
@@ -2020,7 +2087,7 @@ def render_photo_card(photo: M.PhotoState):
         )
         if new_notes != (photo.brief_notes or ""):
             photo.brief_notes = new_notes
-            M.save(manifest)
+            M.save(manifest, ST)
 
         thumb_input = {"Small": 180, "Medium": 260, "Large": 360, "Full": 460}[image_size]
         thumb_variant = {"Small": 140, "Medium": 180, "Large": 240, "Full": 320}[image_size]
@@ -2031,7 +2098,7 @@ def render_photo_card(photo: M.PhotoState):
                   fs_key=f"fs_input_only_{photo.photo_id}",
                   fs_caption=f"Input · {Path(photo.input_path).name}")
         elif view_mode == "Output only":
-            if photo.graded and Path(photo.output_path).exists():
+            if photo.graded:
                 thumb(photo.output_path, width=thumb_compare, caption="Output (graded)",
                       fs_key=f"fs_output_only_{photo.photo_id}",
                       fs_caption=f"Output · {Path(photo.output_path).name}")
@@ -2083,7 +2150,6 @@ def render_photo_card(photo: M.PhotoState):
                 view_mode == "Side by side"
                 and photo.selected_variant
                 and photo.graded
-                and Path(photo.output_path).exists()
             ):
                 st.markdown("##### Grading: variant → harmonizer output")
                 g1, g2 = st.columns(2)
@@ -2112,14 +2178,13 @@ def render_photo_card(photo: M.PhotoState):
                         key=f"sethero_{photo.photo_id}",
                         disabled=is_current_hero, use_container_width=True,
                     ):
-                        hero_dir = Path(manifest.output_root) / ".hero"
-                        hero_dir.mkdir(parents=True, exist_ok=True)
-                        hero_target = hero_dir / Path(photo.output_path).name
-                        hero_target.write_bytes(Path(photo.output_path).read_bytes())
-                        manifest.hero_path = str(hero_target)
+                        out_name = ST.name(photo.output_path)
+                        hero_target = ST.join(manifest.output_root, ".hero", out_name)
+                        ST.write_bytes(hero_target, ST.read_bytes(photo.output_path))
+                        manifest.hero_path = hero_target
                         manifest.hero_photo_id = photo.photo_id
-                        M.save(manifest)
-                        st.success(f"Hero set to {hero_target.name}")
+                        M.save(manifest, ST)
+                        st.success(f"Hero set to {out_name}")
                         st.rerun()
 
         # Prompt
@@ -2134,7 +2199,7 @@ def render_photo_card(photo: M.PhotoState):
         )
         if new_prompt != (photo.prompt or ""):
             photo.prompt = new_prompt
-            M.save(manifest)
+            M.save(manifest, ST)
         if photo.prompt:
             _render_prompt_compliance(photo)
 
@@ -2170,10 +2235,10 @@ def render_photo_card(photo: M.PhotoState):
                 if ref_upload and st.button("Apply + regenerate",
                                             key=f"applyref_{photo.photo_id}",
                                             use_container_width=True):
-                    tmp_dir = output_root / ".swap_refs" / photo.product / stem
-                    tmp_dir.mkdir(parents=True, exist_ok=True)
-                    tmp_path = tmp_dir / ref_upload.name
-                    tmp_path.write_bytes(ref_upload.getvalue())
+                    tmp_path = ST.join(
+                        manifest.output_root, ".swap_refs", photo.product, stem, ref_upload.name
+                    )
+                    ST.write_bytes(tmp_path, ref_upload.getvalue())
                     _handle_regenerate(photo, reference_override=tmp_path, n_variants=n_variants)
 
 
@@ -2271,6 +2336,8 @@ def render_detail_page():
 
 
 # ═══ Main dispatch ═══════════════════════════════════════════════════════
+
+require_password()
 
 route = current_route()
 
