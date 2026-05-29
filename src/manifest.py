@@ -34,6 +34,14 @@ class PhotoState:
     # Storage path (e.g. a graded packshot output). None → fall back to the
     # static product reference files under prompts/product_refs/<product>/.
     product_ref_path: Optional[str] = None
+    # Worn shots only: parametrized prompt support.
+    #   worn_template — the analyzer's templated Nano Banana prompt with the six
+    #       {PLACEHOLDER}s left literal. Cached per render (re-run only if cleared).
+    #   worn_params   — the user's styling selections (param → option key), e.g.
+    #       {"SKIN_TONE": "fair_warm_caucasian", ...}. Randomized at auto-prepare,
+    #       editable per photo. The final `prompt` is assembled from these two.
+    worn_template: Optional[str] = None
+    worn_params: dict = field(default_factory=dict)
 
     @property
     def photo_id(self) -> str:

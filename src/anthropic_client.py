@@ -119,6 +119,69 @@ class AnthropicClient:
             stop_reason=getattr(resp, "stop_reason", "") or "",
         )
 
+    def analyze_worn(
+        self,
+        image_path: Path,
+        system_prompt: str,
+        materials_description: str = "",
+        max_tokens: int | None = None,
+    ) -> ClaudeCallResult:
+        """Worn-render ANALYZER. Send the 3D render + the parametrized analyzer system
+        prompt; receive a *templated* Nano Banana prompt with the six styling
+        {PLACEHOLDER}s left literal (the app fills them later via the assembler).
+
+        Returns the templated prompt with any surrounding ``` fences stripped.
+        """
+        if not system_prompt or not system_prompt.strip():
+            raise RuntimeError("Worn analyzer system prompt missing (prompts/worn_analyzer.md).")
+
+        media_type, b64 = _b64_image(image_path)
+        user_text = (
+            f'Jewelry materials description: "{materials_description.strip()}". Generate the templated prompt.'
+            if materials_description and materials_description.strip()
+            else "No materials description provided — infer from the render. Generate the templated prompt."
+        )
+        resp = self.client.messages.create(
+            model=self.cfg.anthropic_model,
+            max_tokens=max_tokens or self.cfg.anthropic_analyzer_max_tokens,
+            temperature=0.2,
+            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                    {"type": "text", "text": user_text},
+                ],
+            }],
+        )
+        text = "".join(block.text for block in resp.content if block.type == "text").strip()
+        # Strip a surrounding fenced code block if Claude wrapped the prompt.
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+
+        u = resp.usage
+        cost = _compute_cost(
+            self.cfg,
+            in_tok=u.input_tokens,
+            out_tok=u.output_tokens,
+            cache_read=getattr(u, "cache_read_input_tokens", 0) or 0,
+            cache_creation=getattr(u, "cache_creation_input_tokens", 0) or 0,
+        )
+        return ClaudeCallResult(
+            text=text,
+            input_tokens=u.input_tokens,
+            output_tokens=u.output_tokens,
+            cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
+            cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+            cost_usd=cost,
+            stop_reason=getattr(resp, "stop_reason", "") or "",
+        )
+
     def generate_prompt(
         self,
         image_path: Path,

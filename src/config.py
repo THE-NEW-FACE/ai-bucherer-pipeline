@@ -42,6 +42,9 @@ class Config:
     # Anthropic costs (per 1M tokens, USD)
     anthropic_classify_max_tokens: int = 16
     anthropic_prompt_max_tokens: int = 600
+    # Worn-render analyzer emits a long templated prompt (~700 words) — needs more
+    # headroom than the regular prompt cap.
+    anthropic_analyzer_max_tokens: int = 4000
     anthropic_cost_input_per_mtok: float = 3.0
     anthropic_cost_output_per_mtok: float = 15.0
     anthropic_cost_cache_read_per_mtok: float = 0.3
@@ -63,6 +66,7 @@ class Config:
     classifier_prompt: str = ""
     brief_packshot: str = ""
     brief_worn: str = ""
+    worn_analyzer: str = ""    # parametrized worn-render analyzer system prompt
 
     # Root of the auto pipeline package
     root: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
@@ -90,6 +94,14 @@ class Config:
             return path.read_text(encoding="utf-8")
         # Fall back to whatever was loaded at startup
         return self.brief_worn if classification == "worn" else self.brief_packshot
+
+    def get_worn_analyzer(self) -> str:
+        """Return the parametrized worn-render analyzer system prompt. Re-reads from
+        disk on every call so edits take effect without an app reboot."""
+        path = self.root / "prompts" / "worn_analyzer.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return self.worn_analyzer
 
     REF_SLOTS: tuple[int, ...] = (2, 3, 4)
     REF_EXTS: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp")
@@ -186,6 +198,7 @@ def load_config() -> Config:
         gemini_timeout_s=int(gemini.get("timeout_s", 90)),
         anthropic_classify_max_tokens=int(anthropic.get("classify_max_tokens", 16)),
         anthropic_prompt_max_tokens=int(anthropic.get("prompt_max_tokens", 600)),
+        anthropic_analyzer_max_tokens=int(anthropic.get("analyzer_max_tokens", 4000)),
         anthropic_cost_input_per_mtok=float(anthropic.get("cost_input_per_mtok", 3.0)),
         anthropic_cost_output_per_mtok=float(anthropic.get("cost_output_per_mtok", 15.0)),
         anthropic_cost_cache_read_per_mtok=float(anthropic.get("cost_cache_read_per_mtok", 0.3)),
@@ -207,5 +220,6 @@ def load_config() -> Config:
     cfg.classifier_prompt = _read("classifier_prompt.md")
     cfg.brief_packshot = _read("brief_packshot.md")
     cfg.brief_worn = _read("brief_worn.md")
+    cfg.worn_analyzer = _read("worn_analyzer.md")
 
     return cfg

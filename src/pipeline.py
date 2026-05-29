@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from . import manifest as M
+from . import worn_params as WP
 from .anthropic_client import AnthropicClient
 from .config import Config
 from .gemini_client import GeminiClient
@@ -260,6 +261,53 @@ def classify_photo(
     M.save(manifest, st)
 
 
+def _prepare_worn_prompt(
+    cfg: Config,
+    manifest: M.Manifest,
+    photo: M.PhotoState,
+    anthropic_client: AnthropicClient,
+    materials_description: str,
+) -> None:
+    """Parametrized worn-render prompt in two stages:
+
+      1. ANALYZER — Claude analyzes the render once → a *templated* prompt with the
+         six styling {PLACEHOLDER}s left literal. Cached on photo.worn_template;
+         the API call runs only when the template is missing.
+      2. ASSEMBLER — fill the placeholders from photo.worn_params (randomized at
+         first prepare). Instant, no API cost — so changing a styling parameter only
+         re-assembles, never re-analyzes.
+    """
+    st = get_storage(cfg)
+
+    if not photo.worn_template:
+        res = anthropic_client.analyze_worn(
+            Path(st.materialize(photo.input_path)),
+            system_prompt=cfg.get_worn_analyzer(),
+            materials_description=(materials_description or photo.brief_notes or ""),
+        )
+        with _MANIFEST_LOCK:
+            photo.worn_template = res.text
+            photo.cost_usd += res.cost_usd
+            manifest.total_cost_usd += res.cost_usd
+            if res.stop_reason == "max_tokens":
+                photo.last_error = (
+                    "⚠ Worn analyzer output truncated — raise anthropic.analyzer_max_tokens in config.yaml."
+                )
+            M.save(manifest, st)
+
+    # Randomize styling parameters on the first prepare (auto-prepare requirement).
+    if not photo.worn_params:
+        with _MANIFEST_LOCK:
+            photo.worn_params = WP.random_params()
+            M.save(manifest, st)
+
+    with _MANIFEST_LOCK:
+        photo.prompt = WP.assemble(photo.worn_template, photo.worn_params)
+        if photo.last_error and "truncated" in (photo.last_error or ""):
+            photo.last_error = None
+        M.save(manifest, st)
+
+
 def generate_prompt_for(
     cfg: Config,
     manifest: M.Manifest,
@@ -272,11 +320,24 @@ def generate_prompt_for(
     if photo.classification is None:
         classify_photo(cfg, manifest, photo, anthropic_client)
     classification = photo.classification or "packshot"
-    # Packshot shots use ONLY the input 3D render as reference (Image 1).
-    # Worn shots use Image 2/3/4 from prompts/product_refs/<product>/.
-    refs = cfg.get_product_refs(photo.product) if classification == "worn" else {}
     # Per-product description (set at project creation), prepended to the brief.
     product_description = manifest.product_briefs.get(photo.product, "")
+
+    # Worn shots use the parametrized analyzer + assembler. On any failure we fall
+    # back to the legacy brief-based prompt below so generation never hard-fails.
+    if classification == "worn":
+        try:
+            _prepare_worn_prompt(cfg, manifest, photo, anthropic_client, product_description)
+            return
+        except Exception as e:
+            with _MANIFEST_LOCK:
+                photo.last_error = f"Worn analyzer failed ({e}); used legacy brief."
+                M.save(manifest, st)
+            # fall through to the legacy brief path
+
+    # Packshot shots use ONLY the input 3D render as reference (Image 1).
+    # Worn shots (legacy fallback) use Image 2/3/4 from prompts/product_refs/<product>/.
+    refs = cfg.get_product_refs(photo.product) if classification == "worn" else {}
     res = anthropic_client.generate_prompt(
         Path(st.materialize(photo.input_path)),
         classification=classification,

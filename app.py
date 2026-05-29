@@ -34,6 +34,7 @@ from src.anthropic_client import AnthropicClient  # noqa: E402
 from src.config import load_config  # noqa: E402
 from src.gemini_client import GeminiClient  # noqa: E402
 from src import pipeline as P  # noqa: E402
+from src import worn_params as WP  # noqa: E402
 from src.storage import get_storage  # noqa: E402
 
 
@@ -2584,6 +2585,73 @@ def _render_worn_product_ref_controls(manifest: M.Manifest, photo: M.PhotoState)
             st.caption("This packshot is fed as Image 2 on the next ⟳ Regenerate.")
 
 
+def _render_worn_styling_controls(manifest: M.Manifest, photo: M.PhotoState) -> None:
+    """Worn shots only: pick the six styling parameters (skin, makeup, hair, wardrobe).
+
+    These fill the {PLACEHOLDER}s in the render's analyzed prompt template. They are
+    randomized at auto-prepare and editable here; changing them re-assembles the
+    prompt (no re-analysis, no analyzer API cost) and regenerates variants.
+    """
+    thumbs = WP.thumbs_dir(cfg.root / "prompts")
+    current = WP.normalize(photo.worn_params)
+
+    with st.expander("🎨 Styling parameters (worn render)", expanded=False):
+        st.caption(
+            "Skin, makeup, hair, and wardrobe are parametrized — these fill the "
+            "render's analyzed prompt. Randomized on auto-prepare; edit and click "
+            "**Apply & Regenerate**. Changing them never re-analyzes the render."
+        )
+
+        new_sel: dict[str, str] = {}
+        for param in WP.PARAMS:
+            keys = WP.option_keys(param)
+            cur = current[param]
+            idx = keys.index(cur) if cur in keys else 0
+            csel, cthumb = st.columns([3, 1])
+            with csel:
+                chosen = st.selectbox(
+                    WP.PARAM_LABELS[param],
+                    options=keys,
+                    index=idx,
+                    format_func=lambda k, p=param: WP.label(p, k),
+                    key=f"wp_{param}_{photo.photo_id}",
+                )
+            with cthumb:
+                tf = WP.thumb_filename(param, chosen)
+                tp = thumbs / tf if tf else None
+                if tp and tp.exists():
+                    st.image(str(tp), width=58)
+            new_sel[param] = chosen
+
+        changed = new_sel != current
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("🎲 Randomize", key=f"wp_rand_{photo.photo_id}",
+                         use_container_width=True,
+                         help="Pick a fresh random combination"):
+                rnd = WP.random_params()
+                photo.worn_params = rnd
+                photo.prompt = None  # force re-assembly from the cached template
+                # Sync the selectbox widget state so the dropdowns reflect the new pick.
+                for p in WP.PARAMS:
+                    st.session_state[f"wp_{p}_{photo.photo_id}"] = rnd[p]
+                M.save(manifest, ST)
+                st.rerun()
+        with b2:
+            if st.button("✨ Apply & Regenerate", key=f"wp_apply_{photo.photo_id}",
+                         type="primary", use_container_width=True,
+                         disabled=(not cfg.gemini_api_key),
+                         help="Re-assemble the prompt with these parameters and regenerate variants"):
+                photo.worn_params = new_sel
+                photo.prompt = None  # force re-assembly (template stays cached → no analyzer call)
+                M.save(manifest, ST)
+                _handle_regenerate(photo)
+
+        if changed:
+            st.caption("⚠ Unsaved styling changes — click **Apply & Regenerate** to use them.")
+
+
 def _save_image_to_renders(manifest: M.Manifest, photo: M.PhotoState, src, stage: str) -> str:
     """Copy an image (input / variant / graded — any stage) into the product's render
     folder on storage: `<output_root>/<product>/renders/`. Returns the destination path.
@@ -2717,8 +2785,9 @@ def render_photo_card(photo: M.PhotoState):
         # project-wide hero for every photo in this product folder.
         _render_product_hero_controls(manifest, photo)
 
-        # Worn shots: pick a generated packshot as the second Gemini reference.
+        # Worn shots: styling parameters + pick a generated packshot as the 2nd ref.
         if (photo.classification or "packshot") == "worn":
+            _render_worn_styling_controls(manifest, photo)
             _render_worn_product_ref_controls(manifest, photo)
 
         # Brief notes
