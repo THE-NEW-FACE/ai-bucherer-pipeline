@@ -315,12 +315,16 @@ def generate_variants_for(
     # (already real) or a storage path; materialize handles both (no-op for local).
     raw_ref = str(reference_override) if reference_override else photo.input_path
     input_ref = Path(st.materialize(raw_ref))
-    # Same logic as in generate_prompt_for: refs only feed into Gemini for worn shots.
-    additional = (
-        cfg.get_product_refs_ordered(photo.product)
-        if photo.classification == "worn"
-        else []
-    )
+    # Refs only feed into Gemini for worn shots. The SECOND reference (Image 2) is a
+    # generated packshot of the product when the user has picked one on the detail
+    # page (photo.product_ref_path); otherwise fall back to the static product-ref
+    # files under prompts/product_refs/<product>/.
+    additional: list[Path] = []
+    if photo.classification == "worn":
+        if photo.product_ref_path and st.exists(photo.product_ref_path):
+            additional = [Path(st.materialize(photo.product_ref_path))]
+        else:
+            additional = cfg.get_product_refs_ordered(photo.product)
     # Aspect ratio is locked to config.yaml (1:1) — both briefs enforce 1:1 in their
     # output instruction, so no per-call override is needed.
     batch = gemini_client.generate_n(

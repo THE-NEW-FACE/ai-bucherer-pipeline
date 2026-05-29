@@ -1833,13 +1833,18 @@ def render_board_card(photo: M.PhotoState):
     # Wrap the toolbar in a keyed container so the .st-key-boardctrls CSS above
     # can actually reach the buttons (see the CSS comment for why a markdown div
     # can't). Layout: [‹] [chip] [›]  ······  [⤢]; arrows drop when has_nav is False.
+    # The card can compare as soon as there's a rendered image distinct from the
+    # raw input (a graded output or a generated variant). display_img already
+    # encodes that choice without any extra existence probes.
+    can_compare = display_img != photo.input_path
+
     with st.container(key=f"boardctrls-{photo.photo_id}"):
         if has_nav:
-            cPrev, cChip, cNext, cSpacer, cOpen = st.columns([1, 3, 1, 0.5, 1])
+            cPrev, cChip, cNext, cSpacer, cCompare, cOpen = st.columns([1, 3, 1, 0.5, 1, 1])
         else:
             # Arrows hidden; chip takes the space.
             cPrev = cNext = None
-            cChip, cSpacer, cOpen = st.columns([5, 0.5, 1])
+            cChip, cSpacer, cCompare, cOpen = st.columns([5, 0.5, 1, 1])
 
         # State changes go through on_click callbacks, which run before the rerun —
         # the button's return value is intentionally ignored.
@@ -1866,6 +1871,23 @@ def render_board_card(photo: M.PhotoState):
                     help="Next variant",
                     on_click=_cb_variant_step,
                     args=(photo.photo_id, n_variants, +1),
+                )
+        with cCompare:
+            # Calling the @st.dialog directly on click matches the detail page.
+            # before = raw input render; after = the canonical display image
+            # (graded output if saved, else the current variant).
+            if st.button(
+                "🆚", key=f"cmp_board_{photo.photo_id}",
+                use_container_width=True,
+                disabled=not can_compare,
+                help="Compare input ↔ result" if can_compare else "Nothing to compare yet",
+            ):
+                _show_comparison(
+                    before_path=photo.input_path,
+                    after_path=display_img,
+                    before_label="Input (3D render)",
+                    after_label="Graded" if photo.graded else "Variant",
+                    title=Path(photo.input_path).name,
                 )
         with cOpen:
             st.button(
@@ -1985,6 +2007,38 @@ def render_board_page():
         unsafe_allow_html=True,
     )
 
+    # ── Project-wide grading reference (hero) ─────────────────────────────
+    # Packshots colour-match to this hero (strength 0.7). Per-product overrides
+    # (set on a photo's detail page) take precedence for that product.
+    with st.expander("🎯 Project grading reference (hero)", expanded=False):
+        if manifest.hero_path and _path_exists(manifest.hero_path):
+            st.markdown(f"**Current project hero:** `{ST.name(manifest.hero_path)}`")
+            st.image(_board_thumb(manifest.hero_path, max_edge=180), width=180)
+        else:
+            st.caption("No project hero set — packshots are background-normalised only "
+                       "unless a product has its own hero.")
+        hu = st.file_uploader(
+            "Upload a project hero reference",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="proj_hero_upload",
+        )
+        if hu is not None:
+            marker = "__proj_heroup_done"
+            if st.session_state.get(marker) != hu.file_id:
+                tgt = ST.join(manifest.output_root, ".hero", hu.name)
+                ST.write_bytes(tgt, hu.getvalue())
+                manifest.hero_path = tgt
+                manifest.hero_photo_id = None
+                M.save(manifest, ST)
+                st.session_state[marker] = hu.file_id
+                st.success(f"Project hero set: {hu.name}")
+                st.rerun()
+        if manifest.hero_path and st.button("✖ Clear project hero", key="clear_proj_hero"):
+            manifest.hero_path = None
+            manifest.hero_photo_id = None
+            M.save(manifest, ST)
+            st.rerun()
+
     # ── Group photos by product folder (preserve project order)
     products: dict[str, list[M.PhotoState]] = {}
     for photo in manifest.photos.values():
@@ -2067,6 +2121,154 @@ def render_board_page():
 
 
 # ═══ Route: DETAIL (per-photo card; click-from-board) ════════════════════
+
+def _render_product_hero_controls(manifest: M.Manifest, photo: M.PhotoState) -> None:
+    """Per-product grading reference (hero) controls, shown on the detail page.
+
+    The active hero for a photo is resolved per-product override → project-wide
+    default → none (see pipeline.hero_path_for_photo). This block lets the user
+    set the product override from the current graded output, upload an external
+    reference, or clear the override so the product falls back to the project hero.
+    """
+    product = photo.product
+    with st.expander("🎯 Grading reference (hero)", expanded=False):
+        st.caption(
+            "Packshots colour-match to this hero (strength 0.7). Worn shots are "
+            "background-normalised only. A per-product hero overrides the project hero."
+        )
+        per_prod = manifest.product_heroes.get(product)
+        if per_prod:
+            active = f"product override · `{ST.name(per_prod)}`"
+        elif manifest.hero_path:
+            active = f"project hero · `{ST.name(manifest.hero_path)}`"
+        else:
+            active = "none — background-only grading"
+        st.markdown(f"**Active for `{product}`:** {active}")
+
+        effective = P.hero_path_for_photo(cfg, manifest, photo)
+        if effective and _path_exists(effective):
+            st.image(_board_thumb(effective, max_edge=180), width=180)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(
+                f"📌 Use this output as hero for this product",
+                key=f"prodhero_{photo.photo_id}",
+                use_container_width=True,
+                disabled=not photo.graded,
+                help="Grade & save a variant first" if not photo.graded
+                     else "Set this product's grading reference to the saved output",
+            ):
+                name = ST.name(photo.output_path)
+                tgt = ST.join(manifest.output_root, ".hero", "products", product, name)
+                ST.write_bytes(tgt, ST.read_bytes(photo.output_path))
+                manifest.product_heroes[product] = tgt
+                M.save(manifest, ST)
+                st.success(f"Product hero set: {name}")
+                st.rerun()
+        with c2:
+            if st.button(
+                "✖ Clear product override",
+                key=f"clrhero_{photo.photo_id}",
+                use_container_width=True,
+                disabled=not per_prod,
+                help="Fall back to the project-wide hero" if per_prod else "No override set",
+            ):
+                manifest.product_heroes.pop(product, None)
+                M.save(manifest, ST)
+                st.rerun()
+
+        up = st.file_uploader(
+            f"Upload a hero reference for `{product}`",
+            type=["png", "jpg", "jpeg", "webp"],
+            key=f"heroup_{photo.photo_id}",
+        )
+        if up is not None:
+            marker = f"__heroup_done_{photo.photo_id}"
+            if st.session_state.get(marker) != up.file_id:
+                tgt = ST.join(manifest.output_root, ".hero", "products", product, up.name)
+                ST.write_bytes(tgt, up.getvalue())
+                manifest.product_heroes[product] = tgt
+                M.save(manifest, ST)
+                st.session_state[marker] = up.file_id
+                st.success(f"Uploaded {up.name} as hero for {product}")
+                st.rerun()
+
+
+def _render_worn_product_ref_controls(manifest: M.Manifest, photo: M.PhotoState) -> None:
+    """Worn shots only: pick a generated packshot as the SECOND Gemini reference.
+
+    A product folder is classified as a whole, so the packshot of the same physical
+    product usually lives in a different (packshot) folder. We therefore offer every
+    graded packshot across the project. The chosen output is fed as Image 2 on the
+    next regenerate (see pipeline.generate_variants_for). Falls back to the static
+    product-ref files when nothing is picked.
+    """
+    # Candidate generated packshots: graded outputs of packshot-classified photos.
+    candidates = [
+        p for p in manifest.photos.values()
+        if (p.classification or "packshot") == "packshot" and p.graded
+    ]
+    candidates.sort(key=lambda p: p.photo_id)
+
+    with st.expander("🧩 Product reference (generated packshot)", expanded=False):
+        st.caption(
+            "Worn renders use a generated packshot of the product as the second "
+            "reference so the jewellery stays accurate. Grade a packshot first, then "
+            "pick it here. Without a pick, the static product-ref files are used."
+        )
+        if not candidates:
+            st.info("No graded packshots yet — grade a packshot photo, then pick it here.")
+            return
+
+        labels = ["— none (use static product refs) —"] + [p.photo_id for p in candidates]
+        paths = [None] + [p.output_path for p in candidates]
+        try:
+            cur_idx = paths.index(photo.product_ref_path) if photo.product_ref_path in paths else 0
+        except ValueError:
+            cur_idx = 0
+        choice = st.selectbox(
+            "Generated packshot to reference",
+            options=list(range(len(labels))),
+            index=cur_idx,
+            format_func=lambda i: labels[i],
+            key=f"wornref_{photo.photo_id}",
+        )
+        chosen = paths[choice]
+        if chosen != photo.product_ref_path:
+            photo.product_ref_path = chosen
+            M.save(manifest, ST)
+
+        if photo.product_ref_path and _path_exists(photo.product_ref_path):
+            st.image(_board_thumb(photo.product_ref_path, max_edge=180), width=180)
+            st.caption("This packshot is fed as Image 2 on the next ⟳ Regenerate.")
+
+
+def _save_image_to_renders(manifest: M.Manifest, photo: M.PhotoState, src, stage: str) -> str:
+    """Copy an image (input / variant / graded — any stage) into the product's render
+    folder on storage: `<output_root>/<product>/renders/`. Returns the destination path.
+    The filename keeps the source stem + stage + timestamp so nothing is overwritten."""
+    from datetime import datetime
+    data = _local(src).read_bytes()
+    stem = Path(photo.input_path).stem
+    ext = (Path(str(src)).suffix or ".png").lower()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{stem}__{stage}__{ts}{ext}"
+    dest = ST.join(manifest.output_root, photo.product, "renders", name)
+    ST.write_bytes(dest, data)
+    return dest
+
+
+def _save_button(manifest: M.Manifest, photo: M.PhotoState, src, stage: str, key: str) -> None:
+    """A 💾 Save control that drops the given image into the product's render folder."""
+    if st.button("💾 Save", key=key, use_container_width=True,
+                 help=f"Save this {stage} image to the product's render folder"):
+        try:
+            dest = _save_image_to_renders(manifest, photo, src, stage)
+            st.success(f"Saved → {ST.name(dest)}")
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+
 
 def render_photo_card(photo: M.PhotoState):
     """The full per-image lifecycle UI — moved behind a click on the board."""
@@ -2161,6 +2363,16 @@ def render_photo_card(photo: M.PhotoState):
                 unsafe_allow_html=True,
             )
 
+        # ── Grading reference (hero) ──────────────────────────────────────
+        # Packshots colour-match to a hero (strength 0.7); worn shots are
+        # background-normalised only. A per-product hero overrides the
+        # project-wide hero for every photo in this product folder.
+        _render_product_hero_controls(manifest, photo)
+
+        # Worn shots: pick a generated packshot as the second Gemini reference.
+        if (photo.classification or "packshot") == "worn":
+            _render_worn_product_ref_controls(manifest, photo)
+
         # Brief notes
         notes_key = f"notes_{photo.photo_id}"
         new_notes = st.text_input(
@@ -2185,11 +2397,13 @@ def render_photo_card(photo: M.PhotoState):
             thumb(photo.input_path, width=thumb_compare, caption="Input",
                   fs_key=f"fs_input_only_{photo.photo_id}",
                   fs_caption=f"Input · {Path(photo.input_path).name}")
+            _save_button(manifest, photo, photo.input_path, "input", f"save_input_only_{photo.photo_id}")
         elif view_mode == "Output only":
             if photo.graded:
                 thumb(photo.output_path, width=thumb_compare, caption="Output (graded)",
                       fs_key=f"fs_output_only_{photo.photo_id}",
                       fs_caption=f"Output · {Path(photo.output_path).name}")
+                _save_button(manifest, photo, photo.output_path, "graded", f"save_output_only_{photo.photo_id}")
             else:
                 st.caption("_(no output saved yet)_")
         else:
@@ -2199,6 +2413,7 @@ def render_photo_card(photo: M.PhotoState):
                 thumb(photo.input_path, width=thumb_input,
                       fs_key=f"fs_input_{photo.photo_id}",
                       fs_caption=f"Input · {Path(photo.input_path).name}")
+                _save_button(manifest, photo, photo.input_path, "input", f"save_input_{photo.photo_id}")
             with variants_col:
                 if photo.variants:
                     st.caption(f"**Variants ({len(photo.variants)})** — click **Pick** to grade + save")
@@ -2231,6 +2446,8 @@ def render_photo_card(photo: M.PhotoState):
                                          disabled=is_selected or is_grading,
                                          use_container_width=True):
                                 _handle_select(photo, vp)
+                            _save_button(manifest, photo, vp, f"variant-v{i + 1}",
+                                         f"save_var_{photo.photo_id}_{i}")
                 else:
                     st.caption("_(no variants yet — click Regenerate)_")
 
@@ -2246,11 +2463,15 @@ def render_photo_card(photo: M.PhotoState):
                           caption="Selected variant (raw from Nano Banana)",
                           fs_key=f"fs_sel_{photo.photo_id}",
                           fs_caption=f"Selected variant · {Path(photo.selected_variant).name}")
+                    _save_button(manifest, photo, photo.selected_variant, "variant-selected",
+                                 f"save_sel_{photo.photo_id}")
                 with g2:
                     thumb(photo.output_path, width=thumb_compare,
                           caption="Graded (saved to output folder)",
                           fs_key=f"fs_graded_{photo.photo_id}",
                           fs_caption=f"Graded output · {Path(photo.output_path).name}")
+                    _save_button(manifest, photo, photo.output_path, "graded",
+                                 f"save_graded_{photo.photo_id}")
                     if st.button("🆚 Slide: raw → graded", key=f"cmp_grading_{photo.photo_id}",
                                  use_container_width=True):
                         _show_comparison(

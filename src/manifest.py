@@ -29,6 +29,11 @@ class PhotoState:
     graded: bool = False
     cost_usd: float = 0.0
     last_error: Optional[str] = None
+    # Worn shots only: a generated packshot of the same product, used as the
+    # SECOND Gemini reference so the worn render shows the correct product.
+    # Storage path (e.g. a graded packshot output). None → fall back to the
+    # static product reference files under prompts/product_refs/<product>/.
+    product_ref_path: Optional[str] = None
 
     @property
     def photo_id(self) -> str:
