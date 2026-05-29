@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import functools
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 
@@ -575,7 +576,12 @@ def _local(path) -> Path:
 
 
 def _path_exists(path) -> bool:
-    """Existence check that works for both local scratch and Storage paths."""
+    """Existence check that works for both local scratch and Storage paths.
+
+    NOTE: on the Dropbox backend this is a `files_get_metadata` network round-trip.
+    Do NOT call it per-card in the board grid — trust the manifest there (a path
+    listed in photo.variants/output_path exists; ingest reconciles dangling ones)
+    and use `_exists_cached` for low-churn paths that are probed every rerun."""
     p = str(path)
     if Path(p).exists():
         return True
@@ -583,6 +589,50 @@ def _path_exists(path) -> bool:
         return ST.exists(p)
     except Exception:
         return False
+
+
+@st.cache_data(show_spinner=False, ttl=120, max_entries=2048)
+def _cached_exists(path_str: str) -> bool:
+    try:
+        return ST.exists(path_str)
+    except Exception:
+        return False
+
+
+def _exists_cached(path) -> bool:
+    """Existence check with a short cache, for low-churn paths probed on every
+    rerun (hero / product-reference images). A local file short-circuits with no
+    network; for a Dropbox path the result is memoized so autorefresh ticks don't
+    re-hit the API. A just-set hero/ref probes True on its first access (the file
+    is written before the rerun that displays it), so there is no stale-absent
+    window for content the user just created; the 120s TTL eventually reflects an
+    out-of-band deletion."""
+    p = str(path)
+    if Path(p).exists():
+        return True
+    return _cached_exists(p)
+
+
+def _prefetch_materialize(paths) -> None:
+    """Warm the Storage download cache for many paths in parallel, so the board's
+    first paint fetches images concurrently instead of one-by-one. No-op for the
+    local backend, and cheap once warm (each call is then just a local stat that
+    returns the cached file)."""
+    if getattr(ST, "backend", "local") != "dropbox":
+        return
+    uniq = list(dict.fromkeys(str(p) for p in paths if p))
+    if not uniq:
+        return
+
+    def _one(p: str) -> None:
+        try:
+            if not Path(p).exists():
+                ST.materialize(p)
+        except Exception:
+            pass
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(_one, uniq))
 
 
 # NOTE: the api_key arg is part of the cache key (no leading underscore), so a
@@ -711,7 +761,7 @@ def _show_fullscreen():
     idx = max(0, min(st.session_state.get("fs_index", 0), len(imgs) - 1))
     image_path, caption = imgs[idx]
 
-    if not _path_exists(image_path):
+    if not _exists_cached(image_path):
         st.error(f"File not found: {image_path}")
         return
     p = _local(image_path)
@@ -775,7 +825,7 @@ def _show_comparison(
     reuses the same cached data-URL pipeline as the board, so opening this dialog
     is near-instant — the cached JPEGs are already in memory.
     """
-    if not _path_exists(before_path) or not _path_exists(after_path):
+    if not _exists_cached(before_path) or not _exists_cached(after_path):
         st.error(f"Missing image(s):\nbefore: {before_path}\nafter: {after_path}")
         return
     if title:
@@ -870,14 +920,14 @@ def thumb(
     lightbox opens on that group at `fs_index`, so ◀/▶ and the arrow keys flip
     through the set. Otherwise it opens just this image."""
     name = Path(str(image_path)).name
-    if not _path_exists(image_path):
-        st.caption(f"_(missing: {name})_")
-        return
+    # Single materialize+open attempt — no separate existence probe. On the
+    # Dropbox backend that probe was a second network round-trip; if the file is
+    # genuinely missing the open below fails and we show the same "missing" note.
     try:
         img = Image.open(_local(image_path))
         st.image(img, width=width, caption=caption)
-    except Exception as e:
-        st.caption(f"_(can't open {name}: {e})_")
+    except Exception:
+        st.caption(f"_(missing: {name})_")
         return
     if fs_key:
         if st.button("🔍 Full size", key=fs_key, use_container_width=True,
@@ -1354,7 +1404,7 @@ def render_sidebar():
                 st.rerun()
 
             if manifest.hero_path:
-                if _path_exists(manifest.hero_path):
+                if _exists_cached(manifest.hero_path):
                     hero_name = ST.name(manifest.hero_path)
                     st.image(str(_local(manifest.hero_path)), width=200, caption=f"Hero: {hero_name}")
                     hc1, hc2 = st.columns(2)
@@ -1413,7 +1463,7 @@ def render_sidebar():
                 else:
                     for pg in project.products:
                         current_path = manifest.product_heroes.get(pg.folder_name)
-                        current_ok = bool(current_path and _path_exists(current_path))
+                        current_ok = bool(current_path and _exists_cached(current_path))
                         # Per-product card
                         st.markdown(
                             f"<div style='font-size:12px;font-weight:600;color:var(--text);"
@@ -1932,9 +1982,14 @@ def render_board_card(photo: M.PhotoState):
     # force a square 1:1 thumbnail.
     # `photo.graded` is the manifest's own truth that the output was written — trust
     # it instead of a per-card filesystem/API existence probe (cheap on the board grid).
+    # Trust the manifest — no per-card existence probe. On the Dropbox backend a
+    # probe per card was 25 sequential `files_get_metadata` network calls every
+    # rerun (and every 3s autorefresh tick), which froze the board. A path listed
+    # in photo.variants exists (ingest reconciles dangling ones on load); if it
+    # somehow can't be fetched, _board_thumb falls back to a placeholder.
     if photo.graded:
         display_img = photo.output_path
-    elif overlay_path and _path_exists(overlay_path):
+    elif overlay_path:
         display_img = overlay_path
     else:
         display_img = photo.input_path
@@ -2155,7 +2210,7 @@ def render_board_page():
     # Packshots colour-match to this hero (strength 0.7). Per-product overrides
     # (set on a photo's detail page) take precedence for that product.
     with st.expander("🎯 Project grading reference (hero)", expanded=False):
-        if manifest.hero_path and _path_exists(manifest.hero_path):
+        if manifest.hero_path and _exists_cached(manifest.hero_path):
             st.markdown(f"**Current project hero:** `{ST.name(manifest.hero_path)}`")
             st.image(_board_thumb(manifest.hero_path, max_edge=180), width=180)
         else:
@@ -2200,6 +2255,16 @@ def render_board_page():
     card_size = st.session_state.get("board_card_size", "Medium")
     cols_per_row = _board_cols_for_size(card_size)
 
+    # Warm the download cache for every card's display image in parallel. On the
+    # Dropbox backend this turns the first paint from 25 sequential downloads into
+    # a handful of concurrent batches; once warm it's just cheap local stats.
+    _prefetch_materialize(
+        photo.output_path if photo.graded
+        else (photo.variants[_current_board_variant(photo)] if photo.variants
+              else photo.input_path)
+        for photo in manifest.photos.values()
+    )
+
     for product_name in ordered_keys:
         photos = products[product_name]
         # Stable sort by filename within the product
@@ -2212,8 +2277,9 @@ def render_board_page():
 
         cls_class = "badge-worn" if is_worn else "badge-packshot"
         # Per-product hero override flag (small indicator → product uses its own hero, not project default)
-        has_override = bool(manifest.product_heroes.get(product_name)
-                            and _path_exists(manifest.product_heroes[product_name]))
+        # Trust the manifest dict — membership means a hero was written for this
+        # product. Avoids a network existence probe per product on every rerun.
+        has_override = bool(manifest.product_heroes.get(product_name))
         hero_badge = (
             "<span class='badge' style='background:var(--accent-muted);color:var(--accent);"
             "border-color:rgba(212,168,87,0.28);' "
@@ -2290,7 +2356,7 @@ def _render_product_hero_controls(manifest: M.Manifest, photo: M.PhotoState) -> 
         st.markdown(f"**Active for `{product}`:** {active}")
 
         effective = P.hero_path_for_photo(cfg, manifest, photo)
-        if effective and _path_exists(effective):
+        if effective and _exists_cached(effective):
             st.image(_board_thumb(effective, max_edge=180), width=180)
 
         c1, c2 = st.columns(2)
@@ -2383,7 +2449,7 @@ def _render_worn_product_ref_controls(manifest: M.Manifest, photo: M.PhotoState)
             photo.product_ref_path = chosen
             M.save(manifest, ST)
 
-        if photo.product_ref_path and _path_exists(photo.product_ref_path):
+        if photo.product_ref_path and _exists_cached(photo.product_ref_path):
             st.image(_board_thumb(photo.product_ref_path, max_edge=180), width=180)
             st.caption("This packshot is fed as Image 2 on the next ⟳ Regenerate.")
 
@@ -2454,6 +2520,14 @@ def render_photo_card(photo: M.PhotoState):
     is_grading = (gfut is not None) and not gfut.done()
 
     stem = Path(photo.input_path).stem
+
+    # Warm this photo's images in parallel so the detail view's first paint doesn't
+    # download input + output + every variant one-by-one on the Dropbox backend.
+    _prefetch_materialize(
+        [photo.input_path]
+        + ([photo.output_path] if photo.graded else [])
+        + list(photo.variants)
+    )
 
     view_mode = st.session_state.get("detail_view_mode", "Side by side")
     image_size = st.session_state.get("detail_image_size", "Medium")
