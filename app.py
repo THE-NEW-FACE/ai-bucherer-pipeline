@@ -2562,7 +2562,19 @@ def _render_worn_product_ref_controls(manifest: M.Manifest, photo: M.PhotoState)
             st.info("No graded packshots yet — grade a packshot photo, then pick it here.")
             return
 
-        labels = ["— none (use static product refs) —"] + [p.photo_id for p in candidates]
+        def _cand_label(p: M.PhotoState) -> str:
+            # Lead with the product description (per-product brief set at project
+            # creation) so the user picks by what the product IS, not by an opaque
+            # timestamp filename. Keep the folder + filename as a disambiguator,
+            # since several graded packshots can share one description.
+            desc = (manifest.product_briefs.get(p.product) or "").strip()
+            name = ST.name(p.input_path)
+            if desc:
+                short = desc if len(desc) <= 70 else desc[:69].rstrip() + "…"
+                return f"{short}  ·  {p.product}/{name}"
+            return f"{p.product}/{name}"
+
+        labels = ["— none (use static product refs) —"] + [_cand_label(p) for p in candidates]
         paths = [None] + [p.output_path for p in candidates]
         try:
             cur_idx = paths.index(photo.product_ref_path) if photo.product_ref_path in paths else 0
