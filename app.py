@@ -1784,8 +1784,24 @@ def render_loading_page():
     st.title(f"Preparing **{project.name}**")
     st.caption("Generating prompts + variants in parallel. This runs once per project.")
 
+    pending = st.session_state.setdefault("pending_regens", {})
+
+    # Submit any photo that still needs variants and isn't already in flight.
+    # The wizard submits before routing here, but the "open existing project"
+    # path does not — so the loading page is the single, idempotent place that
+    # guarantees pending photos actually get dispatched. Photos that previously
+    # errored are left for manual retry on the board (they count as failed below).
+    for photo in manifest.photos.values():
+        if photo.variants or photo.last_error or photo.photo_id in pending:
+            continue
+        pending[photo.photo_id] = P.submit_regenerate(
+            cfg, manifest, photo,
+            get_anthropic_client(cfg.anthropic_api_key),
+            get_gemini_client(cfg.gemini_api_key),
+            n=st.session_state.get("n_variants_slider", cfg.default_n),
+        )
+
     # Reap any completed futures
-    pending = st.session_state.get("pending_regens", {})
     done_ids = [pid for pid, f in pending.items() if f.done()]
     for pid in done_ids:
         try:
