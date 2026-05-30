@@ -1168,8 +1168,16 @@ def _prefetch_thumbs(display_paths) -> None:
 
     is_dbx = getattr(ST, "backend", "local") == "dropbox"
     if is_dbx:
+        # One request fetches the whole pack (all pre-built thumbs); fall back to a
+        # folder listing for anything not yet packed (e.g. freshly generated).
+        pack = P.read_thumb_pack(ST, out_root)
+        if pack:
+            for src, tp in pairs:
+                if src not in tbytes and ST.name(tp) in pack:
+                    tbytes[src] = pack[ST.name(tp)]
         try:
-            existing = {ST.name(f) for f in ST.list_files(ST.join(out_root, ".thumbs"))}
+            existing = {ST.name(f) for f in ST.list_files(ST.join(out_root, ".thumbs"))} if any(
+                src not in tbytes for src, _ in pairs) else set()
         except Exception:
             existing = set()
         have = lambda tp: ST.name(tp) in existing
@@ -1236,6 +1244,11 @@ def _build_all_thumbs(manifest) -> int:
         with ThreadPoolExecutor(max_workers=12) as ex:
             for n in ex.map(_one, targets):
                 built += n
+    # Bundle all thumbs into one pack so the next cold open is a single request.
+    try:
+        P.write_thumb_pack(ST, manifest.output_root)
+    except Exception:
+        pass
     return built
 
 

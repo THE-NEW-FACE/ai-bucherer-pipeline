@@ -134,6 +134,41 @@ def write_thumb(st: Storage, output_root: str, src_path: str, src_bytes: bytes,
         return None
 
 
+def thumb_pack_path(st: Storage, output_root: str) -> str:
+    return st.join(output_root, ".thumbs", "_pack.json")
+
+
+def write_thumb_pack(st: Storage, output_root: str) -> int:
+    """Bundle every persisted .thumbs/*.jpg into ONE _pack.json ({name: base64}) so a
+    cold board open fetches all thumbnails in a single request instead of N latency-
+    bound downloads (Dropbox's folder-zip endpoint is unavailable under the team-admin
+    client). Rebuilt by 'Build thumbnails'. Returns the number packed."""
+    import base64
+    import json
+    tdir = st.join(output_root, ".thumbs")
+    pack: dict[str, str] = {}
+    for f in st.list_files(tdir):
+        if not f.lower().endswith(".jpg"):
+            continue
+        try:
+            pack[st.name(f)] = base64.b64encode(st.read_bytes(f)).decode("ascii")
+        except Exception:
+            pass
+    st.write_text(thumb_pack_path(st, output_root), json.dumps(pack))
+    return len(pack)
+
+
+def read_thumb_pack(st: Storage, output_root: str) -> dict:
+    """{thumb_filename: jpeg_bytes} from the pack in one request, or {} if absent."""
+    import base64
+    import json
+    try:
+        data = json.loads(st.read_text(thumb_pack_path(st, output_root)))
+        return {k: base64.b64decode(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
 def _get_executor() -> ThreadPoolExecutor:
     """Lazily create the variant-regenerate executor — 4 workers means up to 4 photos
     regenerate in parallel (each spawns its own internal pool for variants)."""
