@@ -2433,20 +2433,34 @@ def _product_grade_defaults(manifest: M.Manifest, product: str, is_worn: bool) -
     return base
 
 
+def _cb_toggle_final(pid: str, vpath: str) -> None:
+    """Star/unstar a graded variant as a final (delivery selection)."""
+    mf = st.session_state.get("manifest")
+    if not mf or pid not in mf.photos:
+        return
+    photo = mf.photos[pid]
+    if vpath in photo.final_variants:
+        photo.final_variants = [v for v in photo.final_variants if v != vpath]
+    else:
+        photo.final_variants.append(vpath)
+    M.save(mf, ST)
+
+
 def render_grade_tile(manifest: M.Manifest, product: str,
                       photo: M.PhotoState, vp: str) -> None:
     """Stage-2 tile: shows the graded (or raw) image. 'Reference' picks this shot as
-    the product's colour reference; ⤢ opens the detail view to fine-tune one shot."""
+    the product's colour reference; ★ stars a graded shot as a final; ⤢ opens detail."""
     disp = photo.display_for(vp)
     graded = photo.is_graded(vp)
+    is_final = photo.is_final(vp)
     vkey = f"{photo.photo_id}::{Path(vp).name}"
     with st.container(key=f"boardimg-{vkey}"):
         st.image(_board_thumb(disp), use_container_width=True)
-    hc, oc = st.columns(2)
-    with hc:
-        if st.button("◎ Reference", key=f"setref::{vkey}", use_container_width=True,
-                     help="Use this shot as the product's colour reference (the look "
-                          "every other shot is matched to)"):
+    rc, fc, oc = st.columns(3)
+    with rc:
+        if st.button("◎ Ref", key=f"setref::{vkey}", use_container_width=True,
+                     help="Use this shot as the product's colour reference (the target "
+                          "every other shot converges to)"):
             name = ST.name(disp)
             tgt = ST.join(manifest.output_root, ".hero", "products", product, name)
             ST.write_bytes(tgt, ST.read_bytes(disp))
@@ -2454,12 +2468,22 @@ def render_grade_tile(manifest: M.Manifest, product: str,
             M.save(manifest, ST)
             st.toast("Reference set.", icon=":material/center_focus_strong:")
             st.rerun()
+    with fc:
+        st.button("★ Final" if is_final else "☆ Final", key=f"fin::{vkey}",
+                  use_container_width=True, disabled=not graded,
+                  help="Grade it first" if not graded else
+                       ("Remove from delivery" if is_final else "Mark as a final to deliver"),
+                  on_click=_cb_toggle_final, args=(photo.photo_id, vp))
     with oc:
         st.button("⤢", key=f"gopen::{vkey}", use_container_width=True,
                   help="Fine-tune this one shot in the detail view",
                   on_click=_cb_open_detail_variant, args=(photo.photo_id,))
-    tag = ("<span class='badge badge-ready'>✓ graded</span>" if graded
-           else "<span class='subtle' style='font-size:11px;'>raw</span>")
+    if is_final:
+        tag = "<span class='badge' style='background:var(--accent-muted);color:var(--accent);'>★ final</span>"
+    elif graded:
+        tag = "<span class='badge badge-ready'>✓ graded</span>"
+    else:
+        tag = "<span class='subtle' style='font-size:11px;'>raw</span>"
     st.markdown(f"<div style='margin-top:2px;'>{tag}</div>", unsafe_allow_html=True)
 
 
@@ -2572,12 +2596,66 @@ def render_grade_workspace(manifest: M.Manifest, product: str,
 
     grid = [(ph, v) for ph, v in tiles if (not show_graded) or ph.is_graded(v)]
     if show_graded and not grid:
-        st.caption("No graded shots yet — click **Apply** to grade the set.")
+        st.caption("No graded shots yet — click **Converge** to grade the set.")
     for row_start in range(0, len(grid), cols_per_row):
         cols = st.columns(cols_per_row, gap="small")
         for i, (ph, v) in enumerate(grid[row_start:row_start + cols_per_row]):
             with cols[i]:
                 render_grade_tile(manifest, product, ph, v)
+
+
+def render_deliver_workspace(manifest: M.Manifest, project, product: str,
+                             photos: list, cols_per_row: int) -> None:
+    """Stage 3 — Deliver: star the graded shots to keep as finals, then export them to
+    a clean 03_Final/<product>/ folder with TNF deliverable names."""
+    graded_tiles = [(ph, v) for ph in photos for v in ph.kept_variants if ph.is_graded(v)]
+    finals = [(ph, v) for ph, v in graded_tiles if ph.is_final(v)]
+    delivered = manifest.delivered.get(product) or []
+    dkey = f"deliver::{product}"
+    dfut = st.session_state.get("pending_grades", {}).get(dkey)
+    exporting = dfut is not None and not dfut.done()
+
+    top_l, top_r = st.columns([3, 2], vertical_alignment="center")
+    with top_l:
+        st.caption(f"Star the shots to deliver ({len(finals)} of {len(graded_tiles)} graded "
+                   "selected), then export. Files land in "
+                   f"`{ST.join(manifest.output_root, '03_Final', product)}`.")
+    with top_r:
+        if st.button(f"⬇ Export {len(finals)} finals → 03_Final", key=f"export_{product}",
+                     type="primary", use_container_width=True,
+                     disabled=exporting or not finals,
+                     help="Pick at least one final" if not finals
+                          else "Copy the starred finals to 03_Final with TNF names"):
+            pend = st.session_state.setdefault("pending_grades", {})
+            pend[dkey] = _get_export_future(manifest, project, product)
+            st.rerun()
+
+    if exporting:
+        st.caption("⚙ Exporting finals…")
+    elif delivered:
+        last = delivered[-1].get("ts", "")[:16].replace("T", " ")
+        st.caption(f"✓ Delivered {len(delivered)} file(s) to 03_Final · last export {last}")
+
+    if not graded_tiles:
+        st.caption("Nothing graded yet — converge the set in ② Grade first.")
+        return
+    for row_start in range(0, len(graded_tiles), cols_per_row):
+        cols = st.columns(cols_per_row, gap="small")
+        for i, (ph, v) in enumerate(graded_tiles[row_start:row_start + cols_per_row]):
+            with cols[i]:
+                vkey = f"{ph.photo_id}::{Path(v).name}"
+                with st.container(key=f"boardimg-{vkey}"):
+                    st.image(_board_thumb(ph.display_for(v)), use_container_width=True)
+                is_final = ph.is_final(v)
+                st.button("★ Final" if is_final else "☆ Final", key=f"find::{vkey}",
+                          use_container_width=True,
+                          help="Remove from delivery" if is_final else "Mark as a final to deliver",
+                          on_click=_cb_toggle_final, args=(ph.photo_id, v))
+
+
+def _get_export_future(manifest: M.Manifest, project, product: str):
+    """Run export_finals in the grade pool (it's just file copies, but keep the UI free)."""
+    return P._get_grade_executor().submit(P.export_finals, cfg, manifest, project, product)
 
 
 def render_board_page():
@@ -2611,6 +2689,7 @@ def render_board_page():
     n_total = len(manifest.photos)
     n_visuals = sum(len(p.kept_variants) for p in manifest.photos.values())
     n_graded = sum(len(p.graded_variants or {}) for p in manifest.photos.values())
+    n_final = sum(len(p.final_kept()) for p in manifest.photos.values())
     pending_count = sum(1 for p in manifest.photos.values() if not p.variants)
 
     h1, h2 = st.columns([5, 2])
@@ -2624,29 +2703,37 @@ def render_board_page():
             f"<span style='color:var(--text-disabled);margin:0 2px;'>·</span>"
             f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>{n_graded}</b> graded</span>"
             f"<span style='color:var(--text-disabled);margin:0 2px;'>·</span>"
+            f"<span><b style='color:var(--accent);font-variant-numeric:tabular-nums;'>{n_final}</b> final</span>"
+            f"<span style='color:var(--text-disabled);margin:0 2px;'>·</span>"
             f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>${manifest.total_cost_usd:.2f}</b> spent</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
     with h2:
         if pending_count:
-            label = f"▶  Auto-prepare {pending_count} pending"
-            if st.button(label, type="primary", use_container_width=True,
-                         help=f"Generate prompts + {st.session_state.get('n_variants_slider', cfg.default_n)} variants "
-                              f"per photo for the {pending_count} photo(s) not yet processed."):
-                for photo in manifest.photos.values():
-                    if photo.variants:
-                        continue
-                    existing = pending.get(photo.photo_id)
-                    if existing is not None and not existing.done():
-                        continue
-                    fut = P.submit_regenerate(
-                        cfg, manifest, photo,
-                        get_anthropic_client(cfg.anthropic_api_key), get_gemini_client(cfg.gemini_api_key),
-                        n=st.session_state.get("n_variants_slider", cfg.default_n),
-                    )
-                    pending[photo.photo_id] = fut
-                st.rerun()
+            n_per = st.session_state.get("n_variants_slider", cfg.default_n)
+            est = pending_count * n_per * cfg.effective_cost_per_image + pending_count * 0.01
+            # Cost-confirm: batch generation spends real money, so make it a two-step
+            # popover with the estimate rather than a one-click trigger.
+            with st.popover(f"▶  Auto-prepare {pending_count} pending", use_container_width=True):
+                st.markdown(f"Generate prompts + **{n_per}** variants for **{pending_count}** "
+                            f"photo(s) not yet processed.")
+                st.markdown(f"Estimated cost: **${est:.2f}** (Nano Banana + Claude).")
+                if st.button("Confirm — generate", type="primary", use_container_width=True,
+                             key="confirm_autoprepare"):
+                    for photo in manifest.photos.values():
+                        if photo.variants:
+                            continue
+                        existing = pending.get(photo.photo_id)
+                        if existing is not None and not existing.done():
+                            continue
+                        fut = P.submit_regenerate(
+                            cfg, manifest, photo,
+                            get_anthropic_client(cfg.anthropic_api_key), get_gemini_client(cfg.gemini_api_key),
+                            n=n_per,
+                        )
+                        pending[photo.photo_id] = fut
+                    st.rerun()
         else:
             st.markdown(
                 "<div style='display:flex;justify-content:flex-end;align-items:center;"
@@ -2812,8 +2899,10 @@ def render_board_page():
                 + "</div>",
                 unsafe_allow_html=True,
             )
+        has_graded_p = any(ph.has_graded for ph in photos)
+        n_final_p = sum(len(ph.final_kept()) for ph in photos)
         with tcol:
-            sc1, sc2 = st.columns(2)
+            sc1, sc2, sc3 = st.columns(3)
             with sc1:
                 if st.button("① Select", key=f"stagesel_{product_name}", use_container_width=True,
                              type="primary" if stage == "select" else "secondary",
@@ -2826,12 +2915,23 @@ def render_board_page():
                              type="primary" if stage == "grade" else "secondary",
                              disabled=not has_kept,
                              help="Keep some generations first" if not has_kept
-                                  else "Grade a hero and harmonize the set"):
+                                  else "Grade one shot, set it as the reference, converge the set"):
                     if stage != "grade":
                         manifest.product_stage[product_name] = "grade"
                         M.save(manifest, ST); st.rerun()
+            with sc3:
+                if st.button("③ Deliver", key=f"stagedel_{product_name}", use_container_width=True,
+                             type="primary" if stage == "deliver" else "secondary",
+                             disabled=not has_graded_p,
+                             help="Grade the set first" if not has_graded_p
+                                  else "Pick finals and export them to 03_Final"):
+                    if stage != "deliver":
+                        manifest.product_stage[product_name] = "deliver"
+                        M.save(manifest, ST); st.rerun()
 
-        if stage == "grade" and has_kept:
+        if stage == "deliver" and has_graded_p:
+            render_deliver_workspace(manifest, project, product_name, photos, cols_per_row)
+        elif stage == "grade" and has_kept:
             render_grade_workspace(manifest, product_name, photos, is_worn, cols_per_row)
         else:
             # Stage 1 — Select: one carousel row per render with kept variants.
