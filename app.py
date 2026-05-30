@@ -3454,6 +3454,37 @@ def render_photo_card(photo: M.PhotoState):
         if photo.prompt:
             _render_prompt_compliance(photo)
 
+        # ── Refine prompt with Claude (comment + optional reference image) ──
+        with st.expander("💬 Refine the prompt with feedback", expanded=False):
+            st.caption("Tell Claude what to change and it rewrites the prompt (worn shots "
+                       "keep their styling dials + 1:1 framing). Then Regenerate. An "
+                       "uploaded image guides Claude's wording only — it is not sent to "
+                       "Nano Banana.")
+            fb = st.text_area(
+                "What should change?", key=f"refinefb_{photo.photo_id}", height=90,
+                placeholder="e.g. 'tighter crop on the ear', 'warmer studio light', "
+                            "'hand resting lower on the jaw', 'thinner hoop'",
+                label_visibility="collapsed",
+            )
+            rimgs = st.file_uploader("Reference image(s) — optional",
+                                     type=["png", "jpg", "jpeg", "webp"],
+                                     accept_multiple_files=True,
+                                     key=f"refineimg_{photo.photo_id}")
+            if st.button("💬 Refine prompt", key=f"refinebtn_{photo.photo_id}",
+                         type="primary", use_container_width=True,
+                         disabled=(not cfg.anthropic_api_key) or not fb.strip()
+                                  or is_generating_prompt):
+                ref_paths = []
+                for up in (rimgs or []):
+                    rp = ST.join(manifest.output_root, ".refine_refs", photo.product, stem, up.name)
+                    ST.write_bytes(rp, up.getvalue())
+                    ref_paths.append(rp)
+                pending_p = st.session_state.setdefault("pending_prompts", {})
+                pending_p[photo.photo_id] = P.submit_refine_prompt(
+                    cfg, manifest, photo, get_anthropic_client(cfg.anthropic_api_key),
+                    fb.strip(), ref_paths)
+                st.rerun()
+
         # Actions
         a1, a2, a3 = st.columns([1, 1, 2])
         with a1:

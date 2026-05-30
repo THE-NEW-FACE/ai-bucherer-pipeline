@@ -635,6 +635,72 @@ def submit_generate_prompt(
     return _get_prompt_executor().submit(_task)
 
 
+# ── Refine a prompt from art-director feedback ───────────────────────────
+
+_PACKSHOT_REFINE_SYS = (
+    "You revise a Nano Banana packshot prompt according to an art director's feedback. "
+    "You receive the 3D render (Image 1), optional AD reference images, the current "
+    "prompt, and the feedback. Apply the feedback faithfully while keeping the prompt's "
+    "structure and any geometry/composition/framing locks intact; if the feedback "
+    "references an attached image, translate what you see into words. Use positive "
+    "phrasing. Output ONLY the revised prompt in one fenced code block."
+)
+
+
+def refine_prompt_for(cfg: Config, manifest: M.Manifest, photo: M.PhotoState,
+                      anthropic_client: AnthropicClient, feedback: str,
+                      ref_paths: Optional[list] = None) -> None:
+    """Revise this photo's prompt from the AD's feedback (+ optional reference images,
+    used only to guide Claude's wording — not sent to Gemini). Worn shots refine the
+    cached template and re-assemble with the current styling params; packshots refine
+    the prompt directly."""
+    st = get_storage(cfg)
+    img = Path(st.materialize(photo.input_path))
+    refs = []
+    for p in (ref_paths or []):
+        try:
+            refs.append(Path(st.materialize(p)))
+        except Exception:
+            pass
+
+    if (photo.classification or "packshot") == "worn":
+        if not photo.worn_template:
+            _prepare_worn_prompt(cfg, manifest, photo, anthropic_client,
+                                 manifest.product_briefs.get(photo.product, ""))
+        res = anthropic_client.refine_prompt(
+            img, photo.worn_template or "", feedback, cfg.get_refine_worn(), ref_image_paths=refs)
+        with _MANIFEST_LOCK:
+            photo.worn_template = res.text
+            photo.cost_usd += res.cost_usd
+            manifest.total_cost_usd += res.cost_usd
+            if not photo.worn_params:
+                photo.worn_params = WP.random_params()
+            photo.prompt = WP.assemble(photo.worn_template, photo.worn_params)
+    else:
+        res = anthropic_client.refine_prompt(
+            img, photo.prompt or "", feedback, _PACKSHOT_REFINE_SYS, ref_image_paths=refs)
+        with _MANIFEST_LOCK:
+            photo.prompt = res.text
+            photo.cost_usd += res.cost_usd
+            manifest.total_cost_usd += res.cost_usd
+    _persist(cfg, manifest)
+
+
+def submit_refine_prompt(cfg: Config, manifest: M.Manifest, photo: M.PhotoState,
+                         anthropic_client: AnthropicClient, feedback: str,
+                         ref_paths: Optional[list] = None) -> Future:
+    """Refine the prompt in the background prompt pool."""
+    def _task():
+        try:
+            refine_prompt_for(cfg, manifest, photo, anthropic_client, feedback, ref_paths)
+        except Exception as e:
+            with _MANIFEST_LOCK:
+                photo.last_error = f"Refine failed: {e}"
+            _persist(cfg, manifest)
+            raise
+    return _get_prompt_executor().submit(_task)
+
+
 def hero_path_for_photo(cfg: Config, manifest: M.Manifest, photo: M.PhotoState) -> Optional[str]:
     """Resolve the grading reference for a photo.
 

@@ -103,6 +103,11 @@ class Config:
             return path.read_text(encoding="utf-8")
         return self.worn_analyzer
 
+    def get_refine_worn(self) -> str:
+        """System prompt for refining a worn template from art-director feedback."""
+        path = self.root / "prompts" / "refine_worn.md"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
     REF_SLOTS: tuple[int, ...] = (2, 3, 4)
     REF_EXTS: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp")
 

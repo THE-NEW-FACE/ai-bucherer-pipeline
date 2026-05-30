@@ -182,6 +182,62 @@ class AnthropicClient:
             stop_reason=getattr(resp, "stop_reason", "") or "",
         )
 
+    def refine_prompt(
+        self,
+        image_path: Path,
+        current_text: str,
+        feedback: str,
+        system_prompt: str,
+        ref_image_paths: list[Path] | None = None,
+        max_tokens: int | None = None,
+    ) -> ClaudeCallResult:
+        """Revise an existing prompt (or worn template) per the art director's feedback.
+        Sends the render (Image 1) + optional AD reference images (Image 2+) + the
+        current prompt + the feedback. Returns the revised prompt, fences stripped."""
+        content: list[dict] = []
+        m1, b1 = _b64_image(image_path)
+        content.append({"type": "image", "source": {"type": "base64", "media_type": m1, "data": b1}})
+        content.append({"type": "text", "text": "[Image 1] above — the 3D render."})
+        for i, rp in enumerate(ref_image_paths or [], start=2):
+            try:
+                m, b = _b64_image(rp)
+            except Exception:
+                continue
+            content.append({"type": "image", "source": {"type": "base64", "media_type": m, "data": b}})
+            content.append({"type": "text", "text": f"[Image {i}] above — art-director reference."})
+        content.append({"type": "text", "text":
+            f"CURRENT PROMPT:\n```\n{current_text}\n```\n\n"
+            f"ART DIRECTOR FEEDBACK:\n{feedback.strip()}\n\n"
+            f"Produce the revised prompt now, following the system instructions exactly."})
+
+        resp = self.client.messages.create(
+            model=self.cfg.anthropic_model,
+            max_tokens=max_tokens or self.cfg.anthropic_analyzer_max_tokens,
+            temperature=0.3,
+            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": content}],
+        )
+        text = "".join(block.text for block in resp.content if block.type == "text").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        u = resp.usage
+        cost = _compute_cost(
+            self.cfg, in_tok=u.input_tokens, out_tok=u.output_tokens,
+            cache_read=getattr(u, "cache_read_input_tokens", 0) or 0,
+            cache_creation=getattr(u, "cache_creation_input_tokens", 0) or 0,
+        )
+        return ClaudeCallResult(
+            text=text, input_tokens=u.input_tokens, output_tokens=u.output_tokens,
+            cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
+            cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+            cost_usd=cost, stop_reason=getattr(resp, "stop_reason", "") or "",
+        )
+
     def generate_prompt(
         self,
         image_path: Path,
