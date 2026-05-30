@@ -2692,6 +2692,98 @@ def render_carousel_row(photo: M.PhotoState, cols_per_row: int) -> None:
                           on_click=_cb_carousel, args=(photo.photo_id, 1, n_slots, len(variants)))
 
 
+def _product_grade_defaults(manifest: M.Manifest, product: str, is_worn: bool) -> dict:
+    base = {"strength": 0 if is_worn else 70, "whiten": True, "warmth": 0, "gold": 0, "cool": 0}
+    base.update(manifest.product_grade_params.get(product) or {})
+    return base
+
+
+def render_grade_tile(manifest: M.Manifest, product: str,
+                      photo: M.PhotoState, vp: str) -> None:
+    """Stage-2 tile: shows the graded (or raw) image with 'Set as hero' + open-detail."""
+    disp = photo.display_for(vp)
+    graded = photo.is_graded(vp)
+    is_hero = bool(manifest.product_heroes.get(product)
+                   and manifest.product_heroes.get(product) == photo.graded_variants.get(vp))
+    vkey = f"{photo.photo_id}::{Path(vp).name}"
+    with st.container(key=f"boardimg-{vkey}"):
+        st.image(_board_thumb(disp), use_container_width=True)
+    hc, oc = st.columns(2)
+    with hc:
+        if st.button("★ Hero", key=f"sethero::{vkey}", use_container_width=True,
+                     help="Grade this with the product settings and make it the hero"):
+            params = manifest.product_grade_params.get(product) or {}
+            overrides = P.grade_overrides_from_params(params) if params else None
+            with st.spinner("Grading hero…"):
+                out = P.grade_variant(cfg, manifest, photo, vp, overrides=overrides)
+                manifest.product_heroes[product] = out
+                M.save(manifest, ST)
+            st.toast("Hero set.", icon="★")
+            st.rerun()
+    with oc:
+        st.button("⤢", key=f"gopen::{vkey}", use_container_width=True,
+                  help="Fine-tune this image in the detail view",
+                  on_click=_cb_open_detail_variant, args=(photo.photo_id,))
+    tag = ("<span class='badge' style='background:var(--accent-muted);color:var(--accent);'>★ hero</span>"
+           if is_hero else ("<span class='badge badge-ready'>✓ graded</span>" if graded
+                            else "<span class='subtle' style='font-size:11px;'>raw</span>"))
+    st.markdown(f"<div style='margin-top:2px;'>{tag}</div>", unsafe_allow_html=True)
+
+
+def render_grade_workspace(manifest: M.Manifest, product: str,
+                           photos: list, is_worn: bool, cols_per_row: int) -> None:
+    """Stage 2 for a product: set a hero (grade one image), tune the grade settings,
+    then Harmonize all the product's images to that hero."""
+    tiles = [(ph, v) for ph in photos for v in ph.kept_variants]
+    hero = manifest.product_heroes.get(product)
+    hero_ok = bool(hero and _exists_cached(hero))
+    hkey = f"harmonize::{product}"
+    hfut = st.session_state.get("pending_grades", {}).get(hkey)
+    harmonizing = hfut is not None and not hfut.done()
+
+    top_l, top_r = st.columns([3, 2], vertical_alignment="center")
+    with top_l:
+        d = _product_grade_defaults(manifest, product, is_worn)
+        with st.popover("🎚 Grade settings", use_container_width=True):
+            st.slider("Colour-match strength", 0, 100, int(d["strength"]), key=f"gp_str_{product}")
+            st.slider("Background warmth", -10, 10, int(d["warmth"]), key=f"gp_warm_{product}")
+            st.slider("Gold saturation", -30, 30, int(d["gold"]), key=f"gp_gold_{product}")
+            st.slider("Diamond cool", 0, 20, int(d["cool"]), key=f"gp_cool_{product}")
+            st.checkbox("Whiten background", value=bool(d["whiten"]), key=f"gp_white_{product}")
+            if st.button("Save settings", key=f"gp_save_{product}", use_container_width=True):
+                manifest.product_grade_params[product] = {
+                    "strength": int(st.session_state[f"gp_str_{product}"]),
+                    "warmth": int(st.session_state[f"gp_warm_{product}"]),
+                    "gold": int(st.session_state[f"gp_gold_{product}"]),
+                    "cool": int(st.session_state[f"gp_cool_{product}"]),
+                    "whiten": bool(st.session_state[f"gp_white_{product}"]),
+                }
+                M.save(manifest, ST)
+                st.toast("Grade settings saved.", icon="🎚")
+    with top_r:
+        if st.button("✨ Harmonize all → hero", key=f"harm_{product}", type="primary",
+                     use_container_width=True, disabled=(not hero_ok) or harmonizing,
+                     help="Set a hero first" if not hero_ok
+                          else "Grade every image of this product to match the hero"):
+            pend = st.session_state.setdefault("pending_grades", {})
+            pend[hkey] = P.submit_harmonize_product(cfg, manifest, product)
+            st.rerun()
+
+    if harmonizing:
+        st.caption("⚙ Harmonizing the product to its hero…")
+    elif hero_ok:
+        st.caption(f"Hero: `{ST.name(hero)}` — set one image as ★ Hero, tune settings, "
+                   f"then Harmonize the rest to match.")
+    else:
+        st.caption("Set one image as ★ Hero to define the look, then Harmonize the rest to it.")
+
+    for row_start in range(0, len(tiles), cols_per_row):
+        cols = st.columns(cols_per_row, gap="small")
+        for i, (ph, v) in enumerate(tiles[row_start:row_start + cols_per_row]):
+            with cols[i]:
+                render_grade_tile(manifest, product, ph, v)
+
+
 def render_board_page():
     project: PROJ.Project | None = st.session_state.get("project")
     manifest: M.Manifest | None = st.session_state.get("manifest")
@@ -2904,34 +2996,58 @@ def render_board_page():
             if has_override else ""
         )
         pend_txt = f" · {n_pending_p} pending" if n_pending_p else ""
-        st.markdown(
-            f"<div style='margin-top:32px;margin-bottom:10px;'>"
-            f"<div class='row-wrap' style='margin-bottom:4px;'>"
-            f"<span style='font-size:17px;font-weight:600;'>{product_name}</span>"
-            f"<span class='badge {cls_class}'>{'worn' if is_worn else 'packshot'}</span>"
-            f"{hero_badge}"
-            f"<span class='subtle' style='font-size:12px;font-variant-numeric:tabular-nums;'>"
-            f"{len(tiles)} visuals · {n_graded_p} graded{pend_txt}"
-            f"</span>"
-            f"</div>"
-            + (f"<div class='subtle' style='font-size:13px;font-style:italic;'>"
-               f"{pg.description}</div>" if pg and pg.description else "")
-            + "</div>",
-            unsafe_allow_html=True,
-        )
+        stage = manifest.product_stage.get(product_name, "select")
+        has_kept = bool(tiles)
 
-        # One carousel row per render that has kept variants: the input 3D render is
-        # pinned on the far left, then that render's variants, with ‹ › arrows on
-        # each side to page through them.
-        rows = [ph for ph in photos if ph.kept_variants]
-        if not rows:
+        hcol, tcol = st.columns([4, 1.6], vertical_alignment="center")
+        with hcol:
             st.markdown(
-                "<div class='subtle' style='font-size:13px;padding:8px 0;'>"
-                "No visuals yet — use <b>Auto-prepare</b> above to generate.</div>",
+                f"<div style='margin-top:28px;'>"
+                f"<div class='row-wrap' style='margin-bottom:4px;'>"
+                f"<span style='font-size:17px;font-weight:600;'>{product_name}</span>"
+                f"<span class='badge {cls_class}'>{'worn' if is_worn else 'packshot'}</span>"
+                f"{hero_badge}"
+                f"<span class='subtle' style='font-size:12px;font-variant-numeric:tabular-nums;'>"
+                f"{len(tiles)} visuals · {n_graded_p} graded{pend_txt}"
+                f"</span>"
+                f"</div>"
+                + (f"<div class='subtle' style='font-size:13px;font-style:italic;'>"
+                   f"{pg.description}</div>" if pg and pg.description else "")
+                + "</div>",
                 unsafe_allow_html=True,
             )
-        for ph in rows:
-            render_carousel_row(ph, cols_per_row)
+        with tcol:
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                if st.button("① Select", key=f"stagesel_{product_name}", use_container_width=True,
+                             type="primary" if stage == "select" else "secondary",
+                             help="Curate the AI generations"):
+                    if stage != "select":
+                        manifest.product_stage[product_name] = "select"
+                        M.save(manifest, ST); st.rerun()
+            with sc2:
+                if st.button("② Grade", key=f"stagegrd_{product_name}", use_container_width=True,
+                             type="primary" if stage == "grade" else "secondary",
+                             disabled=not has_kept,
+                             help="Keep some generations first" if not has_kept
+                                  else "Grade a hero and harmonize the set"):
+                    if stage != "grade":
+                        manifest.product_stage[product_name] = "grade"
+                        M.save(manifest, ST); st.rerun()
+
+        if stage == "grade" and has_kept:
+            render_grade_workspace(manifest, product_name, photos, is_worn, cols_per_row)
+        else:
+            # Stage 1 — Select: one carousel row per render with kept variants.
+            rows = [ph for ph in photos if ph.kept_variants]
+            if not rows:
+                st.markdown(
+                    "<div class='subtle' style='font-size:13px;padding:8px 0;'>"
+                    "No visuals yet — use <b>Auto-prepare</b> above to generate.</div>",
+                    unsafe_allow_html=True,
+                )
+            for ph in rows:
+                render_carousel_row(ph, cols_per_row)
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
     # ── Autorefresh while any background work is running (regen, prompt, grade)
