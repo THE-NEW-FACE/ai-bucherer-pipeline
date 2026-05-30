@@ -24,7 +24,14 @@ class PhotoState:
     user_overrode_classification: bool = False
     brief_notes: str = ""              # user's short description (e.g. "Skyline ring — three asscher diamonds")
     prompt: Optional[str] = None
-    variants: list[str] = field(default_factory=list)         # paths in workspace
+    variants: list[str] = field(default_factory=list)         # all generated variant paths
+    # Gallery model: variants are kept by default; the user soft-deletes weak ones
+    # (paths added to hidden_variants — files stay until "Empty trash" purges them).
+    # Grading is a separate, per-variant step: graded_variants maps a kept variant
+    # path → its graded output path. `selected_variant`/`graded` are retained only
+    # for migrating older single-select manifests (see Manifest.from_json).
+    hidden_variants: list[str] = field(default_factory=list)
+    graded_variants: dict = field(default_factory=dict)       # variant_path → graded output path
     selected_variant: Optional[str] = None
     graded: bool = False
     cost_usd: float = 0.0
@@ -47,6 +54,20 @@ class PhotoState:
     def photo_id(self) -> str:
         # Stable id for keys: relative input path
         return f"{self.product}/{Path(self.input_path).name}"
+
+    @property
+    def kept_variants(self) -> list[str]:
+        """Variants the user has NOT soft-deleted — what the gallery shows."""
+        hidden = set(self.hidden_variants or [])
+        return [v for v in (self.variants or []) if v not in hidden]
+
+    def is_graded(self, variant_path: str) -> bool:
+        return variant_path in (self.graded_variants or {})
+
+    def display_for(self, variant_path: str) -> str:
+        """The image to show for a kept variant: its graded output if it has one,
+        otherwise the raw variant."""
+        return (self.graded_variants or {}).get(variant_path, variant_path)
 
 
 @dataclass
@@ -92,6 +113,12 @@ class Manifest:
     def from_json(cls, data: str) -> "Manifest":
         obj = json.loads(data)
         photos = {k: PhotoState(**v) for k, v in obj.get("photos", {}).items()}
+        # Migrate older single-select manifests to the keep-all gallery model: a
+        # photo that was graded against one picked variant becomes one entry in
+        # graded_variants. Idempotent — only fills when graded_variants is empty.
+        for p in photos.values():
+            if not p.graded_variants and p.graded and p.selected_variant:
+                p.graded_variants = {p.selected_variant: p.output_path}
         return cls(
             brand_root=obj["brand_root"],
             output_root=obj["output_root"],

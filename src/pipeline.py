@@ -654,6 +654,104 @@ def select_variant(
     _persist(cfg, manifest)
 
 
+# ── Gallery model: keep-all variants, soft-delete, grade per variant ──────
+
+def _graded_output_path(st: Storage, manifest: M.Manifest,
+                        photo: M.PhotoState, variant_path: str) -> str:
+    """Per-variant graded deliverable path under <product>/renders/."""
+    stem = st.stem(photo.input_path)
+    vname = st.stem(variant_path)   # e.g. variant_001
+    return st.join(manifest.output_root, photo.product, "renders",
+                   f"{stem}__{vname}__graded.png")
+
+
+def grade_variant(cfg: Config, manifest: M.Manifest,
+                  photo: M.PhotoState, variant_path: str) -> str:
+    """Grade ONE kept variant against the relevant hero and write a per-variant
+    deliverable to <product>/renders/. Records it in photo.graded_variants. Unlike
+    the legacy select_variant, this does not single-select — many variants per photo
+    can be graded and kept. Returns the graded output path."""
+    if variant_path not in photo.variants:
+        raise ValueError(f"variant_path {variant_path} not in variants for {photo.photo_id}")
+    st = get_storage(cfg)
+    src_bytes = st.read_bytes(variant_path)
+
+    hero_rgb = None
+    hero_resolved = hero_path_for_photo(cfg, manifest, photo)
+    if hero_resolved:
+        import numpy as np
+        from PIL import Image as _PI
+        hero_img = _PI.open(st.materialize(hero_resolved)).convert("RGB")
+        hero_rgb = np.array(hero_img)
+
+    graded = grade_image(src_bytes, photo.classification or "packshot", hero_rgb=hero_rgb)
+    out = _graded_output_path(st, manifest, photo, variant_path)
+    st.write_bytes(out, graded)
+    write_thumb(st, manifest.output_root, out, graded)
+
+    with _MANIFEST_LOCK:
+        photo.graded_variants[variant_path] = out
+        photo.graded = True            # legacy: "has at least one graded"
+        photo.selected_variant = variant_path
+    _persist(cfg, manifest)
+    return out
+
+
+def submit_grade_variant(cfg: Config, manifest: M.Manifest,
+                         photo: M.PhotoState, variant_path: str) -> Future:
+    """Grade one variant in the background grading pool."""
+    def _task():
+        try:
+            grade_variant(cfg, manifest, photo, variant_path)
+        except Exception as e:
+            with _MANIFEST_LOCK:
+                photo.last_error = f"Grading failed: {e}"
+            _persist(cfg, manifest)
+            raise
+    return _get_grade_executor().submit(_task)
+
+
+def hide_variant(cfg: Config, manifest: M.Manifest,
+                 photo: M.PhotoState, variant_path: str) -> None:
+    """Soft-delete a variant: hide it from the gallery (file kept, reversible)."""
+    with _MANIFEST_LOCK:
+        if variant_path not in photo.hidden_variants:
+            photo.hidden_variants.append(variant_path)
+    _persist(cfg, manifest)
+
+
+def unhide_variant(cfg: Config, manifest: M.Manifest,
+                   photo: M.PhotoState, variant_path: str) -> None:
+    """Undo a soft-delete."""
+    with _MANIFEST_LOCK:
+        photo.hidden_variants = [v for v in photo.hidden_variants if v != variant_path]
+    _persist(cfg, manifest)
+
+
+def purge_hidden(cfg: Config, manifest: M.Manifest) -> int:
+    """Permanently delete soft-deleted variants (and their graded outputs + thumbs).
+    Returns the count purged."""
+    st = get_storage(cfg)
+    n = 0
+    for photo in manifest.photos.values():
+        for v in list(photo.hidden_variants or []):
+            graded = (photo.graded_variants or {}).get(v)
+            for path in [p for p in (v, graded) if p]:
+                for target in (path, thumb_storage_path(st, manifest.output_root, path)):
+                    try:
+                        st.delete(target)
+                    except Exception:
+                        pass
+            with _MANIFEST_LOCK:
+                photo.variants = [x for x in photo.variants if x != v]
+                photo.graded_variants.pop(v, None)
+            n += 1
+        with _MANIFEST_LOCK:
+            photo.hidden_variants = []
+    _persist(cfg, manifest)
+    return n
+
+
 def submit_grade(
     cfg: Config,
     manifest: M.Manifest,
