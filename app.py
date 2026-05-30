@@ -2472,6 +2472,21 @@ def _grade_defaults(manifest: M.Manifest, photo: M.PhotoState) -> dict:
     return base
 
 
+def _apply_hero_preset(manifest: M.Manifest, photo: M.PhotoState, has_hero: bool) -> None:
+    """The hero IS the grading preset: setting one turns colour-matching on (strength
+    up for packshots; worn stays background-only by design), clearing it turns it off.
+    Updates the product's saved grade params AND the live slider widget so the panel
+    reflects it immediately. Caller saves + reruns."""
+    worn = (photo.classification or "packshot") == "worn"
+    d = _grade_defaults(manifest, photo)
+    d["strength"] = (0 if worn else 70) if has_hero else 0
+    manifest.product_grade_params[photo.product] = {
+        "strength": int(d["strength"]), "whiten": bool(d["whiten"]),
+        "warmth": int(d["warmth"]), "gold": int(d["gold"]), "cool": int(d["cool"]),
+    }
+    st.session_state[f"gstr_{photo.photo_id}"] = int(d["strength"])  # move the slider now
+
+
 def _current_grade_params(manifest: M.Manifest, photo: M.PhotoState) -> dict:
     """Live grade params for this photo, read from the slider widget keys (which hold
     the current values at the START of the run, so the preview above the sliders
@@ -3274,16 +3289,66 @@ def render_photo_card(photo: M.PhotoState):
 
             _inject_arrow_key_nav()  # ← / → flip options (clicks the ◀ ▶ buttons above)
 
-            # ── Grade panel (parameters) — sliders feed both the live preview above
-            #    and Apply (save). Defaults come from the product's last grade.
+            # ── Grade panel — hero reference FIRST (the implied preset), then the
+            #    parameters it sets, which feed the live preview + Apply (save).
             with st.expander("🎚 Grade this option", expanded=True):
-                st.caption(
-                    f"Colour-matches to hero `{ST.name(hero_resolved)}`."
-                    if hero_resolved else
-                    "No hero set — background-normalised only. Set a hero below to colour-match."
-                )
-                if manifest.product_grade_params.get(photo.product):
-                    st.caption("Pre-filled from this product's last grade.")
+                st.markdown("**1 · Grading reference (hero)**")
+                hr_img, hr_ctl = st.columns([1, 2.4], vertical_alignment="center")
+                with hr_img:
+                    if hero_resolved and _exists_cached(hero_resolved):
+                        st.image(_board_thumb(hero_resolved, max_edge=200), use_container_width=True)
+                    else:
+                        st.markdown(
+                            "<div style='aspect-ratio:1/1;border:1px dashed var(--border-subtle);"
+                            "border-radius:var(--r-md);display:flex;align-items:center;"
+                            "justify-content:center;color:var(--text-3);font-size:12px;'>no hero</div>",
+                            unsafe_allow_html=True,
+                        )
+                with hr_ctl:
+                    st.caption(
+                        f"`{ST.name(hero_resolved)}` — this product colour-matches to it. "
+                        f"The parameters below are the preset it implies; tweak to taste."
+                        if hero_resolved else
+                        "Set a reference and the renders will colour-match to it. Without one, "
+                        "grading only normalises the background."
+                    )
+                    hb1, hb2 = st.columns(2)
+                    with hb1:
+                        if st.button("📌 Use this option", key=f"usehero_{photo.photo_id}",
+                                     use_container_width=True,
+                                     help="Set this product's hero to the option shown above"):
+                            name = ST.name(disp)
+                            tgt = ST.join(manifest.output_root, ".hero", "products", photo.product, name)
+                            ST.write_bytes(tgt, ST.read_bytes(disp))
+                            manifest.product_heroes[photo.product] = tgt
+                            _apply_hero_preset(manifest, photo, True)
+                            M.save(manifest, ST)
+                            st.rerun()
+                    with hb2:
+                        if hero_resolved and st.button("✖ Clear", key=f"clrhero2_{photo.photo_id}",
+                                                       use_container_width=True,
+                                                       help="Remove this product's hero override"):
+                            manifest.product_heroes.pop(photo.product, None)
+                            _apply_hero_preset(manifest, photo, False)
+                            M.save(manifest, ST)
+                            st.rerun()
+                    hup = st.file_uploader("Upload a hero reference",
+                                           type=["png", "jpg", "jpeg", "webp"],
+                                           key=f"herofile_{photo.photo_id}",
+                                           label_visibility="collapsed")
+                    if hup is not None:
+                        _m = f"__herofile_done_{photo.photo_id}"
+                        if st.session_state.get(_m) != hup.file_id:
+                            tgt = ST.join(manifest.output_root, ".hero", "products",
+                                          photo.product, hup.name)
+                            ST.write_bytes(tgt, hup.getvalue())
+                            manifest.product_heroes[photo.product] = tgt
+                            _apply_hero_preset(manifest, photo, True)
+                            st.session_state[_m] = hup.file_id
+                            M.save(manifest, ST)
+                            st.rerun()
+
+                st.markdown("**2 · Parameters**")
                 d = _grade_defaults(manifest, photo)
                 gc1, gc2 = st.columns(2)
                 with gc1:
@@ -3326,9 +3391,7 @@ def render_photo_card(photo: M.PhotoState):
         else:
             st.caption("_(no options yet — click Regenerate)_")
 
-        # ── Reference, styling & notes (below the viewer) ─────────────────
-        # Hero: packshots colour-match to it; a per-product hero overrides the project hero.
-        _render_product_hero_controls(manifest, photo)
+        # ── Styling & notes (below the viewer; hero lives in the grade panel above) ──
         if (photo.classification or "packshot") == "worn":
             _render_worn_styling_controls(manifest, photo)
             _render_worn_product_ref_controls(manifest, photo)
