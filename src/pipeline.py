@@ -825,6 +825,45 @@ def submit_grade_variant(cfg: Config, manifest: M.Manifest,
     return _get_grade_executor().submit(_task)
 
 
+def grade_overrides_from_params(params: dict) -> dict:
+    """Convert stored UI grade params (strength 0–100, whiten, warmth, gold, cool)
+    into grade_variant overrides (Settings-shaped)."""
+    return {
+        "strength": float(params.get("strength", 70)) / 100.0,
+        "bg_normalize": bool(params.get("whiten", True)),
+        "bg_warmth": float(params.get("warmth", 0)),
+        "gold_sat": float(params.get("gold", 0)),
+        "diamond_cool": float(params.get("cool", 0)),
+    }
+
+
+def harmonize_product(cfg: Config, manifest: M.Manifest, product: str) -> int:
+    """Stage 2: grade every kept variant of `product` against its hero with the
+    product's saved grade params, so the set is consistent. Worn folders fall back to
+    the background-only preset automatically (grade_image picks by classification).
+    Returns the number of variants graded."""
+    params = manifest.product_grade_params.get(product) or {}
+    overrides = grade_overrides_from_params(params) if params else None
+    n = 0
+    for photo in manifest.photos.values():
+        if photo.product != product:
+            continue
+        for v in photo.kept_variants:
+            try:
+                grade_variant(cfg, manifest, photo, v, overrides=overrides)
+                n += 1
+            except Exception as e:
+                with _MANIFEST_LOCK:
+                    photo.last_error = f"Harmonize failed: {e}"
+    _persist(cfg, manifest)
+    return n
+
+
+def submit_harmonize_product(cfg: Config, manifest: M.Manifest, product: str) -> Future:
+    """Run a whole-product harmonize in the background grading pool."""
+    return _get_grade_executor().submit(harmonize_product, cfg, manifest, product)
+
+
 def hide_variant(cfg: Config, manifest: M.Manifest,
                  photo: M.PhotoState, variant_path: str) -> None:
     """Soft-delete a variant: hide it from the gallery (file kept, reversible)."""
