@@ -3628,20 +3628,32 @@ def _sync_url() -> None:
         st.query_params.clear()
 
 
+def _manifest_is_stale(mf, proj) -> bool:
+    """Detect session objects that predate the running code. Two ways they can be
+    stale after a hot redeploy: (a) rebuilt from a different class object →
+    isinstance fails; (b) same class object but an older definition → the new
+    attributes are simply absent. Check BOTH (attribute presence is the superset)."""
+    if mf is not None and not isinstance(mf, M.Manifest):
+        return True
+    if proj is not None and not isinstance(proj, PROJ.Project):
+        return True
+    if mf is not None:
+        if not hasattr(mf, "delivered") or not hasattr(mf, "product_stage"):
+            return True
+        for p in getattr(mf, "photos", {}).values():
+            if not hasattr(p, "has_graded") or not hasattr(p, "final_variants"):
+                return True
+    return False
+
+
 def _heal_stale_session() -> None:
     """After a hot redeploy, st.session_state can still hold manifest/project objects
     built from the PREVIOUS class definitions (so new fields/accessors like
-    has_graded / final_variants / delivered raise AttributeError). Detect that via
-    isinstance against the CURRENT classes and reload fresh from storage."""
+    has_graded / final_variants / delivered raise AttributeError). Detect that and
+    reload fresh from storage; if we can't, drop to landing cleanly."""
     mf = st.session_state.get("manifest")
     proj = st.session_state.get("project")
-    stale = (
-        (mf is not None and not isinstance(mf, M.Manifest))
-        or (proj is not None and not isinstance(proj, PROJ.Project))
-        or (isinstance(mf, M.Manifest)
-            and any(not isinstance(p, M.PhotoState) for p in mf.photos.values()))
-    )
-    if not stale:
+    if not _manifest_is_stale(mf, proj):
         return
     slug = getattr(proj, "slug", None)
     try:
