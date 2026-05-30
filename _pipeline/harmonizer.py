@@ -177,15 +177,16 @@ def normalize_background(
     return result
 
 
-def estimate_white_cast(lab: np.ndarray, l_pct: float = 80.0,
-                        chroma_cap: float = 25.0) -> tuple[float, float]:
-    """Estimate an image's illuminant colour cast from its white seamless backdrop.
+def estimate_backdrop_lab(lab: np.ndarray, l_pct: float = 80.0,
+                          chroma_cap: float = 25.0) -> np.ndarray:
+    """Estimate an image's white seamless backdrop colour as a mean (L, a, b).
 
     On a packshot the backdrop is the large, brightest, near-neutral region; gold is
     darker and far more chromatic. We take the brightest pixels (top (100-l_pct)%) that
-    are still reasonably neutral (chroma ≤ cap, to reject bright gold speculars) and
-    return their mean (a, b). For a truly white backdrop this is ≈ (0, 0); a warm/cream
-    backdrop shows up as a positive b (and/or a), which is exactly the cast to remove."""
+    are still reasonably neutral (chroma ≤ cap, to reject bright gold speculars). The
+    mean (a, b) is the illuminant cast (≈0 for true white, positive b for cream); the
+    mean L is the backdrop brightness. Used both to neutralize the cast and — when
+    matching the reference — to fill every shot's background to the SAME exact colour."""
     L = lab[..., 0]
     chroma = np.sqrt(lab[..., 1] ** 2 + lab[..., 2] ** 2)
     thr = np.percentile(L, l_pct)
@@ -194,7 +195,9 @@ def estimate_white_cast(lab: np.ndarray, l_pct: float = 80.0,
         sel = L >= thr                                  # relax the chroma cap
     if int(sel.sum()) < 500:
         sel = L >= np.percentile(L, 50.0)               # last resort
-    return float(lab[..., 1][sel].mean()), float(lab[..., 2][sel].mean())
+    return np.array([float(lab[..., 0][sel].mean()),
+                     float(lab[..., 1][sel].mean()),
+                     float(lab[..., 2][sel].mean())])
 
 
 def neutralize_cast(lab: np.ndarray, a_off: float, b_off: float) -> np.ndarray:
@@ -226,6 +229,9 @@ class Settings:
     # masking/transfer so warm/cream backgrounds converge to a common white. Packshot-only
     # (off for worn — a global a/b shift would distort skin/lifestyle pixels).
     wb_neutralize: bool = False
+    # Fill the background to the reference's exact (neutralized) backdrop colour instead
+    # of the hex range, so every shot in a set gets an IDENTICAL background.
+    bg_match_hero: bool = False
 
 
 def harmonize(
@@ -241,10 +247,10 @@ def harmonize(
     # leave un-whitened, while polluting the colour-transfer stats) is corrected on both
     # hero and target before anything else. This is what makes the set truly converge.
     if getattr(s, "wb_neutralize", False):
-        ta, tb = estimate_white_cast(target_lab)
-        target_lab = neutralize_cast(target_lab, ta, tb)
-        ha, hb = estimate_white_cast(hero_lab)
-        hero_lab = neutralize_cast(hero_lab, ha, hb)
+        t_bd = estimate_backdrop_lab(target_lab)
+        target_lab = neutralize_cast(target_lab, t_bd[1], t_bd[2])
+        h_bd = estimate_backdrop_lab(hero_lab)
+        hero_lab = neutralize_cast(hero_lab, h_bd[1], h_bd[2])
 
     if s.use_subject_mask:
         hero_bg = detect_background_mask(hero_lab, s.bg_l_threshold, s.bg_chroma_threshold)
@@ -270,10 +276,17 @@ def harmonize(
         blended = target_lab * (1.0 - s.strength) + matched * s.strength
 
     if s.bg_normalize and s.use_subject_mask:
-        bg_lo = hex_to_lab(s.bg_color_lo_hex)
-        bg_hi = hex_to_lab(s.bg_color_hi_hex)
-        if bg_lo[0] > bg_hi[0]:
-            bg_lo, bg_hi = bg_hi, bg_lo
+        if getattr(s, "bg_match_hero", False):
+            # Fill every shot's background to the SAME exact colour — the reference's
+            # backdrop (neutralized) — so backgrounds are identical across the set, not
+            # merely mapped into a range. lo==hi collapses the L→range ramp to a flat fill.
+            hb = estimate_backdrop_lab(hero_lab)
+            bg_lo = bg_hi = hb
+        else:
+            bg_lo = hex_to_lab(s.bg_color_lo_hex)
+            bg_hi = hex_to_lab(s.bg_color_hi_hex)
+            if bg_lo[0] > bg_hi[0]:
+                bg_lo, bg_hi = bg_hi, bg_lo
         blended = normalize_background(blended, target_bg, bg_lo, bg_hi, s.bg_l_threshold)
 
     if s.bg_warmth != 0 and s.use_subject_mask:

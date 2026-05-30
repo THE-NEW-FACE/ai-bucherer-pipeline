@@ -2263,7 +2263,7 @@ def _cb_detail_opt(pid: str, delta: int, n: int) -> None:
 def _grade_defaults(manifest: M.Manifest, photo: M.PhotoState) -> dict:
     """Per-product saved grade params, falling back to the classification preset."""
     worn = (photo.classification or "packshot") == "worn"
-    base = {"strength": 0 if worn else 70, "whiten": True, "warmth": 0, "gold": 0, "cool": 0}
+    base = {"strength": 0 if worn else 85, "whiten": True, "warmth": 0, "gold": 0, "cool": 0}
     base.update(manifest.product_grade_params.get(photo.product) or {})
     return base
 
@@ -2428,7 +2428,7 @@ def render_carousel_row(photo: M.PhotoState, cols_per_row: int) -> None:
 
 
 def _product_grade_defaults(manifest: M.Manifest, product: str, is_worn: bool) -> dict:
-    base = {"strength": 0 if is_worn else 70, "whiten": True, "warmth": 0, "gold": 0, "cool": 0}
+    base = {"strength": 0 if is_worn else 85, "whiten": True, "warmth": 0, "gold": 0, "cool": 0}
     base.update(manifest.product_grade_params.get(product) or {})
     return base
 

@@ -115,6 +115,7 @@ PACKSHOT_PRESET = Settings(
     use_subject_mask=True,
     bg_normalize=True,
     wb_neutralize=True,    # remove per-image backdrop cast so the set converges to one white
+    bg_match_hero=True,    # fill bg to the reference's exact backdrop → identical backgrounds
     bg_l_threshold=80.0,   # fully mask backdrops down to L80 (was 88 → cream backdrops only
                            # 33%-whitened); the chroma gate still protects chromatic gold
     bg_color_lo_hex="F4F4F5",
