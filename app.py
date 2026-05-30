@@ -577,6 +577,20 @@ st.markdown(
       outline: 2px solid var(--accent);
       outline-offset: -2px;
     }
+
+    /* ── Detail option viewer: cap the image so the WHOLE option fits on screen.
+       The image is wrapped in st.container(key="optview-<id>"); fit it to ~72vh
+       tall (centered), preserving aspect, instead of filling the full width. */
+    div[class*="st-key-optview-"] img {
+      max-height: 72vh !important;
+      max-width: 100% !important;
+      width: auto !important;
+      height: auto !important;
+      margin: 0 auto !important;
+      display: block;
+      object-fit: contain;
+      border-radius: var(--r-md);
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -2450,6 +2464,58 @@ def _cb_detail_opt(pid: str, delta: int, n: int) -> None:
     st.session_state[key] = (cur + delta) % max(n, 1)
 
 
+def _grade_defaults(manifest: M.Manifest, photo: M.PhotoState) -> dict:
+    """Per-product saved grade params, falling back to the classification preset."""
+    worn = (photo.classification or "packshot") == "worn"
+    base = {"strength": 0 if worn else 70, "whiten": True, "warmth": 0, "gold": 0, "cool": 0}
+    base.update(manifest.product_grade_params.get(photo.product) or {})
+    return base
+
+
+def _current_grade_params(manifest: M.Manifest, photo: M.PhotoState) -> dict:
+    """Live grade params for this photo, read from the slider widget keys (which hold
+    the current values at the START of the run, so the preview above the sliders
+    reflects them without a one-rerun lag), falling back to the product default."""
+    d = _grade_defaults(manifest, photo)
+    pid = photo.photo_id
+    return {
+        "strength": st.session_state.get(f"gstr_{pid}", d["strength"]),
+        "warmth": st.session_state.get(f"gwarm_{pid}", d["warmth"]),
+        "whiten": st.session_state.get(f"gwhite_{pid}", d["whiten"]),
+        "gold": st.session_state.get(f"ggold_{pid}", d["gold"]),
+        "cool": st.session_state.get(f"gcool_{pid}", d["cool"]),
+    }
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _cached_preview(variant_local: str, mtime: float, classification: str,
+                    hero_local: str | None, params_key: tuple, max_edge: int = 1100) -> bytes:
+    """Grade a DOWNSCALED copy of the variant in-memory for a fast live preview (not
+    saved). Cached by (path, mtime, classification, hero, params) so it only recomputes
+    when something actually changes."""
+    import dataclasses
+    import numpy as np
+    from src.grader import grade_image as _gi, Settings, PACKSHOT_PRESET, WORN_PRESET
+    img = Image.open(variant_local).convert("RGB")
+    if max(img.size) > max_edge:
+        s = max_edge / max(img.size)
+        img = img.resize((int(img.size[0] * s), int(img.size[1] * s)), Image.LANCZOS)
+    buf = BytesIO(); img.save(buf, format="PNG"); src = buf.getvalue()
+    hero_rgb = None
+    if hero_local:
+        try:
+            hero_rgb = np.array(Image.open(hero_local).convert("RGB"))
+        except Exception:
+            hero_rgb = None
+    strength, whiten, warmth, gold, cool = params_key
+    base = WORN_PRESET if classification == "worn" else PACKSHOT_PRESET
+    settings = dataclasses.replace(
+        base, strength=strength / 100.0, bg_normalize=bool(whiten),
+        bg_warmth=float(warmth), gold_sat=float(gold), diamond_cool=float(cool),
+    )
+    return _gi(src, classification, hero_rgb=hero_rgb, custom_settings=settings)
+
+
 def render_gallery_tile(photo: M.PhotoState, variant_path: str) -> None:
     """One gallery tile = one kept variant. Shows the graded output if the variant
     has been graded, else the raw variant. Hover-light controls: open detail, grade,
@@ -3140,6 +3206,8 @@ def render_photo_card(photo: M.PhotoState):
             gf = st.session_state.get("pending_grades", {}).get(gkey)
             v_grading = gf is not None and not gf.done()
 
+            hero_resolved = P.hero_path_for_photo(cfg, manifest, photo)
+
             nav_l, nav_m, nav_r = st.columns([1, 8, 1], vertical_alignment="center")
             with nav_l:
                 st.button("◀", key=f"optprev_{photo.photo_id}", use_container_width=True,
@@ -3157,18 +3225,41 @@ def render_photo_card(photo: M.PhotoState):
                           disabled=len(kept) < 2, help="Next option (→)",
                           on_click=_cb_detail_opt, args=(photo.photo_id, 1, len(kept)))
 
-            compare = st.toggle("Compare with the 3D render", key=f"cmp_toggle_{photo.photo_id}",
-                                help="Slide between the input render and this option")
-            if compare:
-                from streamlit.components.v1 import html as _html
-                _html(render_hover_card_html(str(photo.input_path), str(disp),
-                                             height_px=620, max_edge=1100),
-                      height=636, scrolling=False)
-            else:
-                try:
-                    st.image(str(_local(disp)), use_container_width=True)
-                except Exception:
-                    st.caption("_(image unavailable)_")
+            # View controls — rendered BEFORE the image so their state is current.
+            vc1, vc2, _vc = st.columns([1.6, 1.8, 5])
+            with vc1:
+                preview = st.checkbox("👁 Preview grade", key=f"prev_toggle_{photo.photo_id}",
+                                      help="Show the current grade live on this image "
+                                           "(not saved — use Apply to save the graded version)")
+            with vc2:
+                compare = st.toggle("Compare with 3D render", key=f"cmp_toggle_{photo.photo_id}",
+                                    help="Slide between the input render and this option")
+
+            params = _current_grade_params(manifest, photo)
+
+            with st.container(key=f"optview-{photo.photo_id}"):
+                if compare:
+                    from streamlit.components.v1 import html as _html
+                    _html(render_hover_card_html(str(photo.input_path), str(disp),
+                                                 height_px=620, max_edge=1100),
+                          height=636, scrolling=False)
+                elif preview:
+                    try:
+                        loc = _local(vp)
+                        mt = loc.stat().st_mtime
+                        hero_loc = str(_local(hero_resolved)) if hero_resolved else None
+                        pk = (int(params["strength"]), 1 if params["whiten"] else 0,
+                              int(params["warmth"]), int(params["gold"]), int(params["cool"]))
+                        with st.spinner("Previewing grade…"):
+                            st.image(_cached_preview(str(loc), mt,
+                                                     photo.classification or "packshot", hero_loc, pk))
+                    except Exception:
+                        st.image(str(_local(disp)))
+                else:
+                    try:
+                        st.image(str(_local(disp)))
+                    except Exception:
+                        st.caption("_(image unavailable)_")
 
             z1, z2, _z = st.columns([1, 1, 5])
             with z1:
@@ -3183,54 +3274,48 @@ def render_photo_card(photo: M.PhotoState):
 
             _inject_arrow_key_nav()  # ← / → flip options (clicks the ◀ ▶ buttons above)
 
-            # ── Grade panel (parameters) ──
+            # ── Grade panel (parameters) — sliders feed both the live preview above
+            #    and Apply (save). Defaults come from the product's last grade.
             with st.expander("🎚 Grade this option", expanded=True):
-                hero_resolved = P.hero_path_for_photo(cfg, manifest, photo)
                 st.caption(
                     f"Colour-matches to hero `{ST.name(hero_resolved)}`."
                     if hero_resolved else
                     "No hero set — background-normalised only. Set a hero below to colour-match."
                 )
-                worn = (photo.classification or "packshot") == "worn"
-                # Default the sliders from the LAST grade applied to this product (so
-                # the AD tunes once and re-applies across the set), falling back to the
-                # classification preset.
-                _base = {"strength": 0 if worn else 70, "whiten": True, "warmth": 0, "gold": 0, "cool": 0}
-                _prod = manifest.product_grade_params.get(photo.product) or {}
-                gs = st.session_state.setdefault(
-                    f"grade::{photo.photo_id}", {**_base, **_prod},
-                )
-                if _prod:
-                    st.caption("Pre-filled from this product's last grade — Apply, or tweak first.")
+                if manifest.product_grade_params.get(photo.product):
+                    st.caption("Pre-filled from this product's last grade.")
+                d = _grade_defaults(manifest, photo)
                 gc1, gc2 = st.columns(2)
                 with gc1:
-                    gs["strength"] = st.slider("Colour-match strength", 0, 100, int(gs["strength"]),
-                                               key=f"gstr_{photo.photo_id}",
-                                               help="How strongly to match the hero's colour (0 = none).")
-                    gs["warmth"] = st.slider("Background warmth", -10, 10, int(gs["warmth"]),
-                                             key=f"gwarm_{photo.photo_id}")
-                    gs["whiten"] = st.checkbox("Whiten background", value=bool(gs["whiten"]),
-                                               key=f"gwhite_{photo.photo_id}")
+                    st.slider("Colour-match strength", 0, 100, int(d["strength"]),
+                              key=f"gstr_{photo.photo_id}",
+                              help="How strongly to match the hero's colour (0 = none).")
+                    st.slider("Background warmth", -10, 10, int(d["warmth"]),
+                              key=f"gwarm_{photo.photo_id}")
+                    st.checkbox("Whiten background", value=bool(d["whiten"]),
+                                key=f"gwhite_{photo.photo_id}")
                 with gc2:
-                    gs["gold"] = st.slider("Gold saturation", -30, 30, int(gs["gold"]),
-                                           key=f"ggold_{photo.photo_id}",
-                                           help="Boost the warmth/richness of gold.")
-                    gs["cool"] = st.slider("Diamond cool", 0, 20, int(gs["cool"]),
-                                           key=f"gcool_{photo.photo_id}",
-                                           help="Cool down bright highlights (diamonds).")
-                if st.button("✓ Re-apply grade" if graded else "Apply grade",
+                    st.slider("Gold saturation", -30, 30, int(d["gold"]),
+                              key=f"ggold_{photo.photo_id}", help="Boost the warmth/richness of gold.")
+                    st.slider("Diamond cool", 0, 20, int(d["cool"]),
+                              key=f"gcool_{photo.photo_id}", help="Cool down bright highlights (diamonds).")
+                st.caption("Tick **👁 Preview grade** above to see these live. **Apply** saves the graded version.")
+                p = _current_grade_params(manifest, photo)
+                if st.button("✓ Re-apply grade (save)" if graded else "Apply grade (save)",
                              key=f"applygrade_{photo.photo_id}", type="primary",
                              use_container_width=True, disabled=v_grading):
                     overrides = {
-                        "strength": gs["strength"] / 100.0,
-                        "bg_normalize": bool(gs["whiten"]),
-                        "bg_warmth": float(gs["warmth"]),
-                        "gold_sat": float(gs["gold"]),
-                        "diamond_cool": float(gs["cool"]),
+                        "strength": p["strength"] / 100.0,
+                        "bg_normalize": bool(p["whiten"]),
+                        "bg_warmth": float(p["warmth"]),
+                        "gold_sat": float(p["gold"]),
+                        "diamond_cool": float(p["cool"]),
                     }
-                    # Remember these as the product's default grade for the rest of
-                    # its variants (persisted so other variants pre-fill with them).
-                    manifest.product_grade_params[photo.product] = dict(gs)
+                    # Remember as the product's default grade for its other variants.
+                    manifest.product_grade_params[photo.product] = {
+                        "strength": int(p["strength"]), "whiten": bool(p["whiten"]),
+                        "warmth": int(p["warmth"]), "gold": int(p["gold"]), "cool": int(p["cool"]),
+                    }
                     M.save(manifest, ST)
                     _cb_grade_variant(photo.photo_id, vp, overrides)
                     st.rerun()
