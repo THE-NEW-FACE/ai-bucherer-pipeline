@@ -1041,74 +1041,102 @@ def _cached_thumb_bytes(path_str: str, mtime: float, max_edge: int) -> bytes:
         return b""
 
 
+def _encode_thumb(raw: bytes, max_edge: int = 512) -> bytes:
+    """Downscale raw image bytes to a small JPEG. Pure CPU, no I/O."""
+    img = Image.open(BytesIO(raw)).convert("RGB")
+    if max(img.size) > max_edge:
+        s = max_edge / max(img.size)
+        img = img.resize((int(img.size[0] * s), int(img.size[1] * s)), Image.LANCZOS)
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=80, optimize=True)
+    return buf.getvalue()
+
+
 def _board_thumb(path, max_edge: int = 500):
-    """Small JPEG bytes for st.image. Prefers the persisted ~512px thumbnail under
-    `<output_root>/.thumbs` (≈30 KB, no 2K download/decode); only when that's absent
-    does it fall back to downloading the full-res image, downscaling, and backfilling
-    the persisted thumb so the next render is fast. Existence is tracked in an
-    in-memory session set populated by `_prefetch_thumbs`, so the board never does a
-    per-tile network probe."""
+    """Small JPEG bytes for st.image. Resolves, in order: (1) bytes already produced
+    by `_prefetch_thumbs` this session, (2) the persisted `.thumbs` file (warmed by
+    prefetch), (3) a last-resort full-res downscale for display. It NEVER uploads or
+    does network I/O — all fetching/encoding/uploading happens off the render thread
+    in `_prefetch_thumbs`, so the board's render loop stays fast and non-blocking."""
     mf = st.session_state.get("manifest")
     if mf is not None:
-        tp = P.thumb_storage_path(ST, mf.output_root, str(path))
-        present = st.session_state.get("__thumbs_present", set())
-        if tp in present or Path(tp).exists():
+        src = str(path)
+        tb = st.session_state.get("__thumb_bytes", {})
+        if src in tb:
+            return tb[src]
+        tp = P.thumb_storage_path(ST, mf.output_root, src)
+        if tp in st.session_state.get("__thumbs_present", set()) or Path(tp).exists():
             try:
                 return _local(tp).read_bytes()
             except Exception:
                 pass
-
+    # Last resort (rare): downscale whatever is locally materialized. No upload.
     local = _local(path)
     try:
         mtime = local.stat().st_mtime
     except OSError:
         mtime = 0.0
     data = _cached_thumb_bytes(str(local), mtime, max_edge)
-    if data and mf is not None:
-        try:
-            tp2 = P.write_thumb(ST, mf.output_root, str(path), local.read_bytes())
-            if tp2:
-                st.session_state.setdefault("__thumbs_present", set()).add(tp2)
-        except Exception:
-            pass
     return data if data else str(local)
 
 
 def _prefetch_thumbs(display_paths) -> None:
-    """Warm persisted thumbnails for the board in one parallel batch and record which
-    exist in `st.session_state['__thumbs_present']`, so `_board_thumb` resolves each
-    tile from memory (no per-tile network probe). For paths whose thumb is missing,
-    warm the full-res image so the per-tile downscale+backfill is fast."""
+    """Prepare every board tile's thumbnail in ONE parallel batch, off the render
+    thread. Learns which thumbs already exist with a single `.thumbs` listing (not N
+    per-tile probes); warms those in parallel; for missing ones, downloads the
+    full-res image, encodes a thumb, uploads it for next time, and caches the bytes
+    in-session — all 8-way parallel. After this, the render loop only reads tiny
+    bytes from memory."""
     mf = st.session_state.get("manifest")
     if mf is None:
         return
     present = st.session_state.setdefault("__thumbs_present", set())
-    pairs = [(str(p), P.thumb_storage_path(ST, mf.output_root, str(p)))
+    tbytes = st.session_state.setdefault("__thumb_bytes", {})
+    out_root = mf.output_root
+    pairs = [(str(p), P.thumb_storage_path(ST, out_root, str(p)))
              for p in display_paths if p]
-    if getattr(ST, "backend", "local") != "dropbox":
-        for src, tp in pairs:
-            if Path(tp).exists():
-                present.add(tp)
-        missing = [src for src, tp in pairs if tp not in present]
-        _prefetch_materialize(missing)
+    # Nothing to do if everything is already resolved this session.
+    if all((src in tbytes or tp in present) for src, tp in pairs):
         return
 
-    def _one(args):
+    is_dbx = getattr(ST, "backend", "local") == "dropbox"
+    if is_dbx:
+        try:
+            existing = {ST.name(f) for f in ST.list_files(ST.join(out_root, ".thumbs"))}
+        except Exception:
+            existing = set()
+        have = lambda tp: ST.name(tp) in existing
+    else:
+        have = lambda tp: Path(tp).exists()
+
+    todo = [(src, tp) for src, tp in pairs if not (src in tbytes or tp in present)]
+    warm = [(src, tp) for src, tp in todo if have(tp)]
+    make = [(src, tp) for src, tp in todo if not have(tp)]
+
+    def _warm(args):
         src, tp = args
         try:
-            ST.materialize(tp)   # download thumb to local cache; raises if it doesn't exist
-            return tp, True
+            ST.materialize(tp)      # tiny download into the local cache
+            return ("present", tp, None)
         except Exception:
-            return tp, False
+            return (None, tp, None)
 
-    todo = [(src, tp) for src, tp in pairs if tp not in present]
-    if todo:
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            for tp, ok in ex.map(_one, todo):
-                if ok:
-                    present.add(tp)
-    missing = [src for src, tp in pairs if tp not in present]
-    _prefetch_materialize(missing)
+    def _make(args):
+        src, tp = args
+        try:
+            data = _encode_thumb(ST.read_bytes(src))   # download full-res + downscale
+            ST.write_bytes(tp, data)                   # persist for next time
+            return ("bytes", src, data)
+        except Exception:
+            return (None, src, None)
+
+    # Tiny thumb fetches are latency-bound, so over-subscribe the pool a bit.
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for kind, key, data in list(ex.map(_warm, warm)) + list(ex.map(_make, make)):
+            if kind == "present":
+                present.add(key)
+            elif kind == "bytes":
+                tbytes[key] = data
 
 
 def _build_all_thumbs(manifest) -> int:
@@ -1138,7 +1166,7 @@ def _build_all_thumbs(manifest) -> int:
 
     built = 0
     if targets:
-        with ThreadPoolExecutor(max_workers=8) as ex:
+        with ThreadPoolExecutor(max_workers=12) as ex:
             for n in ex.map(_one, targets):
                 built += n
     return built
