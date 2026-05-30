@@ -693,20 +693,55 @@ def current_route() -> str:
 
 # ═══ Access gate (shared password for the public deploy) ═════════════════
 
+def _auth_token() -> str:
+    """Unforgeable token for the auth cookie: HMAC of the shared password. The cookie
+    can't be faked without the password, and we store no secret in it."""
+    import hashlib
+    import hmac as _hmac
+    return _hmac.new(cfg.app_password.encode("utf-8"), b"tnf-authed", hashlib.sha256).hexdigest()
+
+
+def _set_auth_cookie(token: str) -> None:
+    """Persist the auth token as a 30-day cookie via the parent document (the
+    components iframe is same-origin, so window.parent.document.cookie reaches the
+    real page). Read back on later loads through st.context.cookies."""
+    from streamlit.components.v1 import html as _html
+    _html(
+        f"<script>try{{window.parent.document.cookie="
+        f"'tnf_auth={token}; max-age=2592000; path=/; SameSite=Lax';}}catch(e){{}}</script>",
+        height=0,
+    )
+
+
 def require_password() -> None:
     """Gate the whole app behind a shared password when APP_PASSWORD is configured.
 
-    No password set (local dev / desktop) → no gate. Otherwise the rest of the page
-    is withheld (st.stop) until the user enters the correct password once per session.
-    Comparison is constant-time to avoid leaking length/prefix via timing.
+    Auth persists across refreshes via a signed cookie (HMAC of the password), read
+    natively through st.context.cookies — so a refresh does not bounce the user back
+    to the password page. No password set (local dev) → no gate.
     """
     if not cfg.app_password:
         return
+
+    token = _auth_token()
+
     if st.session_state.get("_authed"):
+        # Just logged in this session → persist the cookie once (on a clean run, so the
+        # injected JS actually flushes to the client) for future refreshes.
+        if st.session_state.pop("__set_auth_cookie", False):
+            _set_auth_cookie(token)
         return
 
-    import hmac
+    # Returning visitor: a valid cookie skips the prompt entirely (no flash — the
+    # cookie is on the request, read synchronously).
+    try:
+        if st.context.cookies.get("tnf_auth") == token:
+            st.session_state["_authed"] = True
+            return
+    except Exception:
+        pass
 
+    import hmac
     _l, mid, _r = st.columns([1, 1.4, 1])
     with mid:
         st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
@@ -723,6 +758,7 @@ def require_password() -> None:
         if ok:
             if hmac.compare_digest(pw, cfg.app_password):
                 st.session_state["_authed"] = True
+                st.session_state["__set_auth_cookie"] = True   # write cookie on next (clean) run
                 st.rerun()
             else:
                 st.error("Incorrect password.")
@@ -1493,6 +1529,7 @@ def _close_project():
     # can mutate the dict-like during iteration.
     for k in [k for k in st.session_state.keys() if str(k).startswith("vidx::")]:
         del st.session_state[k]
+    st.query_params.clear()   # so _restore_from_url doesn't re-open the project on rerun
     set_route("landing")
     st.rerun()
 
@@ -3251,9 +3288,52 @@ def render_detail_page():
         st_autorefresh(interval=1500, key="detail_poll", limit=None)
 
 
+# ═══ URL state (refresh restores the same view) ══════════════════════════
+
+def _restore_from_url() -> None:
+    """On a fresh page load (e.g. browser refresh) the session is empty, so rebuild
+    it from the URL query params and land on the same board/detail view instead of
+    bouncing to the landing page."""
+    if st.session_state.get("project") is not None:
+        return  # state already present this session
+    slug = st.query_params.get("project")
+    if not slug:
+        return
+    try:
+        proj = PROJ.load_project(cfg, slug)
+        if not proj:
+            return
+        st.session_state["project"] = proj
+        st.session_state["manifest"] = _load_manifest_for_project(proj)
+        route = st.query_params.get("route") or "board"
+        st.session_state["route"] = route if route in ("board", "detail") else "board"
+        photo = st.query_params.get("photo")
+        if photo and st.session_state["route"] == "detail":
+            st.session_state["detail_photo_id"] = photo
+    except Exception:
+        # Bad/stale URL → fall back to landing cleanly.
+        st.query_params.clear()
+
+
+def _sync_url() -> None:
+    """Reflect the current view in the URL so a refresh can restore it."""
+    proj = st.session_state.get("project")
+    route = current_route()
+    if proj is not None and route in ("board", "detail"):
+        desired = {"project": proj.slug, "route": route}
+        if route == "detail" and st.session_state.get("detail_photo_id"):
+            desired["photo"] = st.session_state["detail_photo_id"]
+        if dict(st.query_params) != desired:
+            st.query_params.clear()
+            st.query_params.update(desired)
+    elif dict(st.query_params):
+        st.query_params.clear()
+
+
 # ═══ Main dispatch ═══════════════════════════════════════════════════════
 
 require_password()
+_restore_from_url()
 
 route = current_route()
 
@@ -3273,3 +3353,5 @@ elif route == "detail":
 else:
     set_route("landing")
     st.rerun()
+
+_sync_url()
