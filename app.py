@@ -2718,7 +2718,7 @@ def render_grade_tile(manifest: M.Manifest, product: str,
                 out = P.grade_variant(cfg, manifest, photo, vp, overrides=overrides)
                 manifest.product_heroes[product] = out
                 M.save(manifest, ST)
-            st.toast("Hero set.", icon="★")
+            st.toast("Hero set.", icon=":material/star:")
             st.rerun()
     with oc:
         st.button("⤢", key=f"gopen::{vkey}", use_container_width=True,
@@ -2759,7 +2759,7 @@ def render_grade_workspace(manifest: M.Manifest, product: str,
                     "whiten": bool(st.session_state[f"gp_white_{product}"]),
                 }
                 M.save(manifest, ST)
-                st.toast("Grade settings saved.", icon="🎚")
+                st.toast("Grade settings saved.", icon=":material/tune:")
     with top_r:
         if st.button("✨ Harmonize all → hero", key=f"harm_{product}", type="primary",
                      use_container_width=True, disabled=(not hero_ok) or harmonizing,
