@@ -591,6 +591,46 @@ st.markdown(
       object-fit: contain;
       border-radius: var(--r-md);
     }
+
+    /* ── Gallery tile polish: compact, borderless control buttons, revealed on
+       hover so the visuals lead and the chrome stays quiet. */
+    div[class*="st-key-boardctrls-"] .stButton button {
+      border: none !important;
+      background: transparent !important;
+      color: var(--text-2) !important;
+      min-height: 30px !important;
+      padding: 2px 0 !important;
+      font-size: 15px;
+    }
+    div[class*="st-key-boardctrls-"] .stButton button:hover {
+      background: var(--bg-elev-2) !important;
+      color: var(--text) !important;
+    }
+    /* Hide the per-tile toolbar until the tile is hovered (keyboard focus also
+       reveals it for accessibility). */
+    div[class*="st-key-tile-"] div[class*="st-key-boardctrls-"] {
+      opacity: 0;
+      transition: opacity 120ms ease;
+    }
+    div[class*="st-key-tile-"]:hover div[class*="st-key-boardctrls-"],
+    div[class*="st-key-tile-"]:focus-within div[class*="st-key-boardctrls-"] {
+      opacity: 1;
+    }
+    /* Carousel ‹ › arrows: tall, borderless, subtle until hovered. */
+    div[class*="st-key-carrow-"] .stButton button {
+      border: none !important;
+      background: transparent !important;
+      color: var(--text-3) !important;
+      font-size: 26px !important;
+      min-height: 140px !important;
+      padding: 0 !important;
+      line-height: 1;
+    }
+    div[class*="st-key-carrow-"] .stButton button:hover {
+      color: var(--text) !important;
+      background: var(--bg-elev-1) !important;
+      border-radius: var(--r-md);
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -2575,36 +2615,34 @@ def render_gallery_tile(photo: M.PhotoState, variant_path: str) -> None:
     gfut = st.session_state.get("pending_grades", {}).get(gkey)
     is_grading = gfut is not None and not gfut.done()
 
-    with st.container(key=f"boardimg-{vkey}"):
-        st.image(_board_thumb(disp), use_container_width=True)
-
-    with st.container(key=f"boardctrls-{vkey}"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.button("⤢", key=f"open::{vkey}", use_container_width=True,
-                      help="Open detail view",
-                      on_click=_cb_open_detail_variant, args=(photo.photo_id,))
-        with c2:
-            if is_grading:
-                st.button("…", key=f"grd::{vkey}", use_container_width=True,
-                          disabled=True, help="Grading…")
-            elif is_graded:
-                st.button("✓", key=f"grd::{vkey}", use_container_width=True,
-                          help="Graded — click to re-grade against the current hero",
-                          on_click=_cb_grade_variant, args=(photo.photo_id, variant_path))
-            else:
-                st.button("◧", key=f"grd::{vkey}", use_container_width=True,
-                          disabled=not cfg.anthropic_api_key and False,  # grading is local
-                          help="Grade — colour-match to the hero",
-                          on_click=_cb_grade_variant, args=(photo.photo_id, variant_path))
-        with c3:
-            st.button("✕", key=f"del::{vkey}", use_container_width=True,
-                      help="Delete this variant (reversible — Undo at the top)",
-                      on_click=_cb_hide_variant, args=(photo.photo_id, variant_path))
-
-    badge = ("<span class='badge badge-ready'>✓ graded</span>" if is_graded
-             else f"<span class='subtle' style='font-size:11px;'>{vname}</span>")
-    st.markdown(f"<div style='margin-top:2px;'>{badge}</div>", unsafe_allow_html=True)
+    with st.container(key=f"tile-{vkey}"):   # hover-reveals the control toolbar (CSS)
+        with st.container(key=f"boardimg-{vkey}"):
+            st.image(_board_thumb(disp), use_container_width=True)
+        with st.container(key=f"boardctrls-{vkey}"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.button("⤢", key=f"open::{vkey}", use_container_width=True,
+                          help="Open detail view",
+                          on_click=_cb_open_detail_variant, args=(photo.photo_id,))
+            with c2:
+                if is_grading:
+                    st.button("…", key=f"grd::{vkey}", use_container_width=True,
+                              disabled=True, help="Grading…")
+                elif is_graded:
+                    st.button("✓", key=f"grd::{vkey}", use_container_width=True,
+                              help="Graded — click to re-grade against the current hero",
+                              on_click=_cb_grade_variant, args=(photo.photo_id, variant_path))
+                else:
+                    st.button("◧", key=f"grd::{vkey}", use_container_width=True,
+                              help="Grade — colour-match to the hero",
+                              on_click=_cb_grade_variant, args=(photo.photo_id, variant_path))
+            with c3:
+                st.button("✕", key=f"del::{vkey}", use_container_width=True,
+                          help="Delete this variant (reversible — Undo at the top)",
+                          on_click=_cb_hide_variant, args=(photo.photo_id, variant_path))
+        if is_graded:
+            st.markdown("<div style='margin-top:2px;'><span class='badge badge-ready'>"
+                        "✓ graded</span></div>", unsafe_allow_html=True)
 
 
 def render_input_tile(photo: M.PhotoState) -> None:
@@ -2637,9 +2675,10 @@ def render_carousel_row(photo: M.PhotoState, cols_per_row: int) -> None:
                       gap="small", vertical_alignment="center")
     with cols[0]:
         if can_prev:
-            st.button("‹", key=f"cprev::{photo.photo_id}", use_container_width=True,
-                      help="Previous variants",
-                      on_click=_cb_carousel, args=(photo.photo_id, -1, n_slots, len(variants)))
+            with st.container(key=f"carrow-prev-{photo.photo_id}"):
+                st.button("‹", key=f"cprev::{photo.photo_id}", use_container_width=True,
+                          help="Previous variants",
+                          on_click=_cb_carousel, args=(photo.photo_id, -1, n_slots, len(variants)))
     with cols[1]:
         render_input_tile(photo)
     for j, v in enumerate(window):
@@ -2647,9 +2686,10 @@ def render_carousel_row(photo: M.PhotoState, cols_per_row: int) -> None:
             render_gallery_tile(photo, v)
     with cols[-1]:
         if can_next:
-            st.button("›", key=f"cnext::{photo.photo_id}", use_container_width=True,
-                      help="More variants",
-                      on_click=_cb_carousel, args=(photo.photo_id, 1, n_slots, len(variants)))
+            with st.container(key=f"carrow-next-{photo.photo_id}"):
+                st.button("›", key=f"cnext::{photo.photo_id}", use_container_width=True,
+                          help="More variants",
+                          on_click=_cb_carousel, args=(photo.photo_id, 1, n_slots, len(variants)))
 
 
 def render_board_page():
