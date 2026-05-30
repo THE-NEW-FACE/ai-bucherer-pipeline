@@ -177,6 +177,37 @@ def normalize_background(
     return result
 
 
+def estimate_white_cast(lab: np.ndarray, l_pct: float = 80.0,
+                        chroma_cap: float = 25.0) -> tuple[float, float]:
+    """Estimate an image's illuminant colour cast from its white seamless backdrop.
+
+    On a packshot the backdrop is the large, brightest, near-neutral region; gold is
+    darker and far more chromatic. We take the brightest pixels (top (100-l_pct)%) that
+    are still reasonably neutral (chroma ≤ cap, to reject bright gold speculars) and
+    return their mean (a, b). For a truly white backdrop this is ≈ (0, 0); a warm/cream
+    backdrop shows up as a positive b (and/or a), which is exactly the cast to remove."""
+    L = lab[..., 0]
+    chroma = np.sqrt(lab[..., 1] ** 2 + lab[..., 2] ** 2)
+    thr = np.percentile(L, l_pct)
+    sel = (L >= thr) & (chroma <= chroma_cap)
+    if int(sel.sum()) < 500:
+        sel = L >= thr                                  # relax the chroma cap
+    if int(sel.sum()) < 500:
+        sel = L >= np.percentile(L, 50.0)               # last resort
+    return float(lab[..., 1][sel].mean()), float(lab[..., 2][sel].mean())
+
+
+def neutralize_cast(lab: np.ndarray, a_off: float, b_off: float) -> np.ndarray:
+    """Remove a global illuminant cast by shifting a/b so the backdrop becomes neutral.
+    Applied to the whole image (it's an illuminant correction): the backdrop lands on
+    a≈b≈0 and the subject's own cast is corrected the same way, so every image in a set
+    is brought to the same white point before matching — the key to real convergence."""
+    out = lab.copy()
+    out[..., 1] = lab[..., 1] - a_off
+    out[..., 2] = lab[..., 2] - b_off
+    return out
+
+
 @dataclass
 class Settings:
     """All per-image tunable parameters. Hashable for caching."""
@@ -191,6 +222,10 @@ class Settings:
     bg_warmth: float = 0.0
     gold_sat: float = 0.0
     diamond_cool: float = 0.0
+    # White-balance neutralization: remove each image's backdrop illuminant cast before
+    # masking/transfer so warm/cream backgrounds converge to a common white. Packshot-only
+    # (off for worn — a global a/b shift would distort skin/lifestyle pixels).
+    wb_neutralize: bool = False
 
 
 def harmonize(
@@ -200,6 +235,16 @@ def harmonize(
 ) -> tuple[np.ndarray, np.ndarray]:
     hero_lab = rgb_to_lab(hero_rgb)
     target_lab = rgb_to_lab(target_rgb)
+
+    # White-balance: neutralize each image's backdrop cast FIRST, so a warm/cream
+    # background (which the chroma gate would otherwise misclassify as foreground and
+    # leave un-whitened, while polluting the colour-transfer stats) is corrected on both
+    # hero and target before anything else. This is what makes the set truly converge.
+    if getattr(s, "wb_neutralize", False):
+        ta, tb = estimate_white_cast(target_lab)
+        target_lab = neutralize_cast(target_lab, ta, tb)
+        ha, hb = estimate_white_cast(hero_lab)
+        hero_lab = neutralize_cast(hero_lab, ha, hb)
 
     if s.use_subject_mask:
         hero_bg = detect_background_mask(hero_lab, s.bg_l_threshold, s.bg_chroma_threshold)
