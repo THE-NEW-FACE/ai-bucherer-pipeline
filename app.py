@@ -3628,9 +3628,41 @@ def _sync_url() -> None:
         st.query_params.clear()
 
 
+def _heal_stale_session() -> None:
+    """After a hot redeploy, st.session_state can still hold manifest/project objects
+    built from the PREVIOUS class definitions (so new fields/accessors like
+    has_graded / final_variants / delivered raise AttributeError). Detect that via
+    isinstance against the CURRENT classes and reload fresh from storage."""
+    mf = st.session_state.get("manifest")
+    proj = st.session_state.get("project")
+    stale = (
+        (mf is not None and not isinstance(mf, M.Manifest))
+        or (proj is not None and not isinstance(proj, PROJ.Project))
+        or (isinstance(mf, M.Manifest)
+            and any(not isinstance(p, M.PhotoState) for p in mf.photos.values()))
+    )
+    if not stale:
+        return
+    slug = getattr(proj, "slug", None)
+    try:
+        if slug:
+            fresh = PROJ.load_project(cfg, slug)
+            if fresh:
+                st.session_state["project"] = fresh
+                st.session_state["manifest"] = _load_manifest_for_project(fresh)
+                return
+    except Exception:
+        pass
+    # Couldn't reload — drop to landing cleanly so nothing references stale objects.
+    for k in ("manifest", "project", "detail_photo_id"):
+        st.session_state.pop(k, None)
+    st.session_state["route"] = "landing"
+
+
 # ═══ Main dispatch ═══════════════════════════════════════════════════════
 
 require_password()
+_heal_stale_session()
 _restore_from_url()
 
 route = current_route()
