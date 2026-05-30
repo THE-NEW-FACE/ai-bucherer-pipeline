@@ -558,15 +558,29 @@ def generate_variants_for(
         write_thumb(st, manifest.output_root, vp, r.image_bytes)  # persist a fast board thumbnail
         paths.append(vp)
 
+    # Fresh generations reuse the same variant_NNN.png paths, so any prior
+    # graded/hidden flags (keyed by those paths) would wrongly stick to the NEW
+    # images — a never-graded regeneration still showing "✓ graded" (and
+    # display_for serving the OLD graded file), or a variant coming back
+    # soft-deleted. Reset them and delete the now-orphaned graded outputs.
     # Lock the manifest mutation + save so parallel regenerates on different photos
     # don't lose total_cost_usd updates or corrupt the JSON write.
+    stale_graded = list((photo.graded_variants or {}).values())
     with _MANIFEST_LOCK:
         photo.variants = paths
+        photo.hidden_variants = []
+        photo.graded_variants = {}
         photo.selected_variant = None
         photo.graded = False
         photo.cost_usd += batch.cost_usd
         photo.last_error = "; ".join(batch.errors) if batch.errors else None
         manifest.total_cost_usd += batch.cost_usd
+    # Delete orphaned graded files outside the lock (network I/O on Dropbox).
+    for old in stale_graded:
+        try:
+            st.delete(old)
+        except Exception:
+            pass
     _persist(cfg, manifest)
 
 
