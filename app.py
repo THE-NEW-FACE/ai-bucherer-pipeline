@@ -3240,131 +3240,116 @@ def render_photo_card(photo: M.PhotoState):
                           disabled=len(kept) < 2, help="Next option (→)",
                           on_click=_cb_detail_opt, args=(photo.photo_id, 1, len(kept)))
 
-            # View controls — rendered BEFORE the image so their state is current.
-            vc1, vc2, _vc = st.columns([1.6, 1.8, 5])
-            with vc1:
-                preview = st.checkbox("👁 Preview grade", key=f"prev_toggle_{photo.photo_id}",
-                                      help="Show the current grade live on this image "
-                                           "(not saved — use Apply to save the graded version)")
-            with vc2:
-                compare = st.toggle("Compare with 3D render", key=f"cmp_toggle_{photo.photo_id}",
-                                    help="Slide between the input render and this option")
-
+            # Image LEFT, grade controls RIGHT — so the AD tunes and previews together.
             params = _current_grade_params(manifest, photo)
+            img_col, grade_col = st.columns([2, 1.25], gap="large")
 
-            with st.container(key=f"optview-{photo.photo_id}"):
-                if compare:
-                    from streamlit.components.v1 import html as _html
-                    _html(render_hover_card_html(str(photo.input_path), str(disp),
-                                                 height_px=620, max_edge=1100),
-                          height=636, scrolling=False)
-                elif preview:
-                    try:
-                        loc = _local(vp)
-                        mt = loc.stat().st_mtime
-                        hero_loc = str(_local(hero_resolved)) if hero_resolved else None
-                        pk = (int(params["strength"]), 1 if params["whiten"] else 0,
-                              int(params["warmth"]), int(params["gold"]), int(params["cool"]))
-                        with st.spinner("Previewing grade…"):
-                            st.image(_cached_preview(str(loc), mt,
-                                                     photo.classification or "packshot", hero_loc, pk))
-                    except Exception:
-                        st.image(str(_local(disp)))
-                else:
-                    try:
-                        st.image(str(_local(disp)))
-                    except Exception:
-                        st.caption("_(image unavailable)_")
-
-            z1, z2, _z = st.columns([1, 1, 5])
-            with z1:
-                if st.button("🔍 Zoom", key=f"optzoom_{photo.photo_id}", use_container_width=True,
-                             help="Open full-resolution with pan/zoom"):
-                    _open_fullscreen(
-                        [(str(photo.display_for(v)), Path(v).name) for v in kept], idx)
-            with z2:
-                st.button("✕ Delete", key=f"optdel_{photo.photo_id}", use_container_width=True,
-                          help="Delete this option (reversible — Undo on the board)",
-                          on_click=_cb_hide_variant, args=(photo.photo_id, vp))
-
-            _inject_arrow_key_nav()  # ← / → flip options (clicks the ◀ ▶ buttons above)
-
-            # ── Grade panel — hero reference FIRST (the implied preset), then the
-            #    parameters it sets, which feed the live preview + Apply (save).
-            with st.expander("🎚 Grade this option", expanded=True):
-                st.markdown("**1 · Grading reference (hero)**")
-                hr_img, hr_ctl = st.columns([1, 2.4], vertical_alignment="center")
-                with hr_img:
-                    if hero_resolved and _exists_cached(hero_resolved):
-                        st.image(_board_thumb(hero_resolved, max_edge=200), use_container_width=True)
+            with img_col:
+                vc1, vc2 = st.columns(2)
+                with vc1:
+                    preview = st.checkbox("👁 Preview grade", key=f"prev_toggle_{photo.photo_id}",
+                                          help="Show the current grade live on this image "
+                                               "(not saved — use Apply to save the graded version)")
+                with vc2:
+                    compare = st.toggle("Compare with 3D render", key=f"cmp_toggle_{photo.photo_id}",
+                                        help="Slide between the input render and this option")
+                with st.container(key=f"optview-{photo.photo_id}"):
+                    if compare:
+                        from streamlit.components.v1 import html as _html
+                        _html(render_hover_card_html(str(photo.input_path), str(disp),
+                                                     height_px=620, max_edge=1100),
+                              height=636, scrolling=False)
+                    elif preview:
+                        try:
+                            loc = _local(vp)
+                            mt = loc.stat().st_mtime
+                            hero_loc = str(_local(hero_resolved)) if hero_resolved else None
+                            pk = (int(params["strength"]), 1 if params["whiten"] else 0,
+                                  int(params["warmth"]), int(params["gold"]), int(params["cool"]))
+                            with st.spinner("Previewing grade…"):
+                                st.image(_cached_preview(str(loc), mt,
+                                                         photo.classification or "packshot", hero_loc, pk))
+                        except Exception:
+                            st.image(str(_local(disp)))
                     else:
-                        st.markdown(
-                            "<div style='aspect-ratio:1/1;border:1px dashed var(--border-subtle);"
-                            "border-radius:var(--r-md);display:flex;align-items:center;"
-                            "justify-content:center;color:var(--text-3);font-size:12px;'>no hero</div>",
-                            unsafe_allow_html=True,
-                        )
-                with hr_ctl:
-                    st.caption(
-                        f"`{ST.name(hero_resolved)}` — this product colour-matches to it. "
-                        f"The parameters below are the preset it implies; tweak to taste."
-                        if hero_resolved else
-                        "Set a reference and the renders will colour-match to it. Without one, "
-                        "grading only normalises the background."
-                    )
-                    hb1, hb2 = st.columns(2)
-                    with hb1:
-                        if st.button("📌 Use this option", key=f"usehero_{photo.photo_id}",
-                                     use_container_width=True,
-                                     help="Set this product's hero to the option shown above"):
-                            name = ST.name(disp)
-                            tgt = ST.join(manifest.output_root, ".hero", "products", photo.product, name)
-                            ST.write_bytes(tgt, ST.read_bytes(disp))
-                            manifest.product_heroes[photo.product] = tgt
-                            _apply_hero_preset(manifest, photo, True)
-                            M.save(manifest, ST)
-                            st.rerun()
-                    with hb2:
-                        if hero_resolved and st.button("✖ Clear", key=f"clrhero2_{photo.photo_id}",
-                                                       use_container_width=True,
-                                                       help="Remove this product's hero override"):
-                            manifest.product_heroes.pop(photo.product, None)
-                            _apply_hero_preset(manifest, photo, False)
-                            M.save(manifest, ST)
-                            st.rerun()
-                    hup = st.file_uploader("Upload a hero reference",
-                                           type=["png", "jpg", "jpeg", "webp"],
-                                           key=f"herofile_{photo.photo_id}",
-                                           label_visibility="collapsed")
-                    if hup is not None:
-                        _m = f"__herofile_done_{photo.photo_id}"
-                        if st.session_state.get(_m) != hup.file_id:
-                            tgt = ST.join(manifest.output_root, ".hero", "products",
-                                          photo.product, hup.name)
-                            ST.write_bytes(tgt, hup.getvalue())
-                            manifest.product_heroes[photo.product] = tgt
-                            _apply_hero_preset(manifest, photo, True)
-                            st.session_state[_m] = hup.file_id
-                            M.save(manifest, ST)
-                            st.rerun()
+                        try:
+                            st.image(str(_local(disp)))
+                        except Exception:
+                            st.caption("_(image unavailable)_")
+                z1, z2 = st.columns(2)
+                with z1:
+                    if st.button("🔍 Zoom", key=f"optzoom_{photo.photo_id}", use_container_width=True,
+                                 help="Open full-resolution with pan/zoom"):
+                        _open_fullscreen(
+                            [(str(photo.display_for(v)), Path(v).name) for v in kept], idx)
+                with z2:
+                    st.button("✕ Delete", key=f"optdel_{photo.photo_id}", use_container_width=True,
+                              help="Delete this option (reversible — Undo on the board)",
+                              on_click=_cb_hide_variant, args=(photo.photo_id, vp))
+                _inject_arrow_key_nav()  # ← / → flip options (clicks the ◀ ▶ buttons above)
+
+            with grade_col:
+                # ── Grade panel — hero (the implied preset) first, then parameters;
+                #    both feed the live preview on the left + Apply (save). Stacked
+                #    single-column since this side panel is narrow.
+                st.markdown("##### 🎚 Grade")
+                st.markdown("**1 · Reference (hero)**")
+                if hero_resolved and _exists_cached(hero_resolved):
+                    st.image(_board_thumb(hero_resolved, max_edge=200), width=132)
+                    st.caption(f"`{ST.name(hero_resolved)}` — colour-matched to this. "
+                               f"The parameters are the preset it implies.")
+                else:
+                    st.caption("No hero — set one to colour-match the renders to it; "
+                               "without one, grading only normalises the background.")
+                hb1, hb2 = st.columns(2)
+                with hb1:
+                    if st.button("📌 Use this", key=f"usehero_{photo.photo_id}",
+                                 use_container_width=True,
+                                 help="Set this product's hero to the option on the left"):
+                        name = ST.name(disp)
+                        tgt = ST.join(manifest.output_root, ".hero", "products", photo.product, name)
+                        ST.write_bytes(tgt, ST.read_bytes(disp))
+                        manifest.product_heroes[photo.product] = tgt
+                        _apply_hero_preset(manifest, photo, True)
+                        M.save(manifest, ST)
+                        st.rerun()
+                with hb2:
+                    if hero_resolved and st.button("✖ Clear", key=f"clrhero2_{photo.photo_id}",
+                                                   use_container_width=True,
+                                                   help="Remove this product's hero override"):
+                        manifest.product_heroes.pop(photo.product, None)
+                        _apply_hero_preset(manifest, photo, False)
+                        M.save(manifest, ST)
+                        st.rerun()
+                hup = st.file_uploader("Upload a hero reference",
+                                       type=["png", "jpg", "jpeg", "webp"],
+                                       key=f"herofile_{photo.photo_id}",
+                                       label_visibility="collapsed")
+                if hup is not None:
+                    _m = f"__herofile_done_{photo.photo_id}"
+                    if st.session_state.get(_m) != hup.file_id:
+                        tgt = ST.join(manifest.output_root, ".hero", "products",
+                                      photo.product, hup.name)
+                        ST.write_bytes(tgt, hup.getvalue())
+                        manifest.product_heroes[photo.product] = tgt
+                        _apply_hero_preset(manifest, photo, True)
+                        st.session_state[_m] = hup.file_id
+                        M.save(manifest, ST)
+                        st.rerun()
 
                 st.markdown("**2 · Parameters**")
                 d = _grade_defaults(manifest, photo)
-                gc1, gc2 = st.columns(2)
-                with gc1:
-                    st.slider("Colour-match strength", 0, 100, int(d["strength"]),
-                              key=f"gstr_{photo.photo_id}",
-                              help="How strongly to match the hero's colour (0 = none).")
-                    st.slider("Background warmth", -10, 10, int(d["warmth"]),
-                              key=f"gwarm_{photo.photo_id}")
-                    st.checkbox("Whiten background", value=bool(d["whiten"]),
-                                key=f"gwhite_{photo.photo_id}")
-                with gc2:
-                    st.slider("Gold saturation", -30, 30, int(d["gold"]),
-                              key=f"ggold_{photo.photo_id}", help="Boost the warmth/richness of gold.")
-                    st.slider("Diamond cool", 0, 20, int(d["cool"]),
-                              key=f"gcool_{photo.photo_id}", help="Cool down bright highlights (diamonds).")
-                st.caption("Tick **👁 Preview grade** above to see these live. **Apply** saves the graded version.")
+                st.slider("Colour-match strength", 0, 100, int(d["strength"]),
+                          key=f"gstr_{photo.photo_id}",
+                          help="How strongly to match the hero's colour (0 = none).")
+                st.slider("Background warmth", -10, 10, int(d["warmth"]),
+                          key=f"gwarm_{photo.photo_id}")
+                st.slider("Gold saturation", -30, 30, int(d["gold"]),
+                          key=f"ggold_{photo.photo_id}", help="Boost the warmth/richness of gold.")
+                st.slider("Diamond cool", 0, 20, int(d["cool"]),
+                          key=f"gcool_{photo.photo_id}", help="Cool down bright highlights (diamonds).")
+                st.checkbox("Whiten background", value=bool(d["whiten"]),
+                            key=f"gwhite_{photo.photo_id}")
                 p = _current_grade_params(manifest, photo)
                 if st.button("✓ Re-apply grade (save)" if graded else "Apply grade (save)",
                              key=f"applygrade_{photo.photo_id}", type="primary",
@@ -3376,7 +3361,6 @@ def render_photo_card(photo: M.PhotoState):
                         "gold_sat": float(p["gold"]),
                         "diamond_cool": float(p["cool"]),
                     }
-                    # Remember as the product's default grade for its other variants.
                     manifest.product_grade_params[photo.product] = {
                         "strength": int(p["strength"]), "whiten": bool(p["whiten"]),
                         "warmth": int(p["warmth"]), "gold": int(p["gold"]), "cool": int(p["cool"]),
@@ -3384,6 +3368,7 @@ def render_photo_card(photo: M.PhotoState):
                     M.save(manifest, ST)
                     _cb_grade_variant(photo.photo_id, vp, overrides)
                     st.rerun()
+                st.caption("Tick **👁 Preview grade** to see changes live; **Apply** saves the graded version.")
                 if v_grading:
                     st.caption("⚙ Grading…")
         elif photo.variants:
