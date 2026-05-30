@@ -586,7 +586,7 @@ st.markdown(
       max-width: 100% !important;
       width: auto !important;
       height: auto !important;
-      margin: 0 auto !important;
+      margin: 0 !important;            /* left-anchored — stays put when toggling compare */
       display: block;
       object-fit: contain;
       border-radius: var(--r-md);
@@ -1074,6 +1074,21 @@ def _image_to_data_url(path, max_edge: int = 900, quality: int = 82) -> str:
     return _cached_data_url(str(local), mtime, max_edge, quality)
 
 
+def _bytes_to_data_url(data: bytes, max_edge: int = 1100, quality: int = 82) -> str:
+    """Downscaled JPEG data URL from raw bytes (e.g. a live-graded preview) — for the
+    compare slider's overlay when there's no file on disk."""
+    try:
+        img = Image.open(BytesIO(data)).convert("RGB")
+        if max(img.size) > max_edge:
+            s = max_edge / max(img.size)
+            img = img.resize((int(img.size[0] * s), int(img.size[1] * s)), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return ""
+
+
 @st.cache_data(show_spinner=False, max_entries=512)
 def _cached_thumb_bytes(path_str: str, mtime: float, max_edge: int) -> bytes:
     """Downscaled JPEG bytes, cached by (path, mtime, max_edge). Used by the board
@@ -1305,15 +1320,18 @@ def render_hover_card_html(
     overlay_path: str | None,
     height_px: int = 280,
     max_edge: int = 900,
+    overlay_url: str | None = None,
+    align: str = "center",
 ) -> str:
     """One self-contained HTML+JS card.
     `input_path` is the bottom image (always the 3D render).
     `overlay_path` is the top image (the variant) — clipped left→right based on mouseX.
-    If overlay_path is None, only the input image is shown.
-    `max_edge` caps the encoded JPEG's long edge — board uses 900, dialog uses 1280.
+    Pass `overlay_url` to supply the top image directly (e.g. a live-graded preview)
+    instead of a path. `align` ('center'|'flex-start') anchors the card in the frame.
     """
     input_url = _image_to_data_url(input_path, max_edge=max_edge)
-    overlay_url = _image_to_data_url(overlay_path, max_edge=max_edge) if overlay_path else None
+    if overlay_url is None:
+        overlay_url = _image_to_data_url(overlay_path, max_edge=max_edge) if overlay_path else None
 
     # Size the card to the input image's TRUE aspect ratio so the slider shows the
     # real proportions instead of a centre-cropped (object-fit:cover) distortion.
@@ -1346,7 +1364,7 @@ def render_hover_card_html(
     <style>
       html, body {{ margin:0; padding:0; background:transparent; overflow:hidden; }}
       .wrap {{
-        display:flex; align-items:center; justify-content:center;
+        display:flex; align-items:center; justify-content:{align};
         width:100%; height:{height_px}px;
       }}
       .card {{
@@ -3253,24 +3271,37 @@ def render_photo_card(photo: M.PhotoState):
                 with vc2:
                     compare = st.toggle("Compare with 3D render", key=f"cmp_toggle_{photo.photo_id}",
                                         help="Slide between the input render and this option")
+                # Live-graded bytes when Preview is on (reused by both the plain view
+                # and the compare overlay so they always show the same thing).
+                preview_bytes = None
+                if preview:
+                    try:
+                        loc = _local(vp)
+                        mt = loc.stat().st_mtime
+                        hero_loc = str(_local(hero_resolved)) if hero_resolved else None
+                        pk = (int(params["strength"]), 1 if params["whiten"] else 0,
+                              int(params["warmth"]), int(params["gold"]), int(params["cool"]))
+                        with st.spinner("Previewing grade…"):
+                            preview_bytes = _cached_preview(str(loc), mt,
+                                                            photo.classification or "packshot", hero_loc, pk)
+                    except Exception:
+                        preview_bytes = None
+
                 with st.container(key=f"optview-{photo.photo_id}"):
                     if compare:
                         from streamlit.components.v1 import html as _html
-                        _html(render_hover_card_html(str(photo.input_path), str(disp),
-                                                     height_px=620, max_edge=1100),
+                        # When previewing, compare the GRADED preview against the render;
+                        # else compare the saved/raw option. Left-anchored so the image
+                        # stays put when toggling.
+                        ov_url = _bytes_to_data_url(preview_bytes, 1100) if preview_bytes else None
+                        _html(render_hover_card_html(
+                                  str(photo.input_path),
+                                  None if ov_url else str(disp),
+                                  height_px=620, max_edge=1100,
+                                  overlay_url=ov_url, align="flex-start"),
                               height=636, scrolling=False)
-                    elif preview:
-                        try:
-                            loc = _local(vp)
-                            mt = loc.stat().st_mtime
-                            hero_loc = str(_local(hero_resolved)) if hero_resolved else None
-                            pk = (int(params["strength"]), 1 if params["whiten"] else 0,
-                                  int(params["warmth"]), int(params["gold"]), int(params["cool"]))
-                            with st.spinner("Previewing grade…"):
-                                st.image(_cached_preview(str(loc), mt,
-                                                         photo.classification or "packshot", hero_loc, pk))
-                        except Exception:
-                            st.image(str(_local(disp)))
+                    elif preview_bytes is not None:
+                        st.image(preview_bytes)
                     else:
                         try:
                             st.image(str(_local(disp)))
