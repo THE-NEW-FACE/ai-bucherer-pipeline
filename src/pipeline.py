@@ -716,17 +716,20 @@ def submit_refine_prompt(cfg: Config, manifest: M.Manifest, photo: M.PhotoState,
 
 
 def hero_path_for_photo(cfg: Config, manifest: M.Manifest, photo: M.PhotoState) -> Optional[str]:
-    """Resolve the grading reference for a photo.
+    """Resolve the grading reference (colour hero) for a photo.
 
-    Priority:
-      1. Per-product override (`manifest.product_heroes[photo.product]`)
-      2. Project-wide default (`manifest.hero_path`)
-      3. None (grading runs background-only)
+    The per-product setting is AUTHORITATIVE when present, so the art director can
+    fully control the reference per product — including turning it off:
+      • key present, non-empty, file exists → that path (explicit reference)
+      • key present but "" or a missing file → None (explicit "no reference",
+        controls-only grading — do NOT silently fall back to the project hero)
+      • key absent → inherit the project-wide default (`manifest.hero_path`)
+      • nothing set anywhere → None (grading runs background-only)
     """
     st = get_storage(cfg)
-    per_product = manifest.product_heroes.get(photo.product)
-    if per_product and st.exists(per_product):
-        return per_product
+    if photo.product in (manifest.product_heroes or {}):
+        ref = manifest.product_heroes.get(photo.product)
+        return ref if (ref and st.exists(ref)) else None
     if manifest.hero_path and st.exists(manifest.hero_path):
         return manifest.hero_path
     return None

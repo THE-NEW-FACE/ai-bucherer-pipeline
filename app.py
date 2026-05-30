@@ -2700,86 +2700,139 @@ def _product_grade_defaults(manifest: M.Manifest, product: str, is_worn: bool) -
 
 def render_grade_tile(manifest: M.Manifest, product: str,
                       photo: M.PhotoState, vp: str) -> None:
-    """Stage-2 tile: shows the graded (or raw) image with 'Set as hero' + open-detail."""
+    """Stage-2 tile: shows the graded (or raw) image. 'Reference' picks this shot as
+    the product's colour reference; ⤢ opens the detail view to fine-tune one shot."""
     disp = photo.display_for(vp)
     graded = photo.is_graded(vp)
-    is_hero = bool(manifest.product_heroes.get(product)
-                   and manifest.product_heroes.get(product) == photo.graded_variants.get(vp))
     vkey = f"{photo.photo_id}::{Path(vp).name}"
     with st.container(key=f"boardimg-{vkey}"):
         st.image(_board_thumb(disp), use_container_width=True)
     hc, oc = st.columns(2)
     with hc:
-        if st.button("★ Hero", key=f"sethero::{vkey}", use_container_width=True,
-                     help="Grade this with the product settings and make it the hero"):
-            params = manifest.product_grade_params.get(product) or {}
-            overrides = P.grade_overrides_from_params(params) if params else None
-            with st.spinner("Grading hero…"):
-                out = P.grade_variant(cfg, manifest, photo, vp, overrides=overrides)
-                manifest.product_heroes[product] = out
-                M.save(manifest, ST)
-            st.toast("Hero set.", icon=":material/star:")
+        if st.button("◎ Reference", key=f"setref::{vkey}", use_container_width=True,
+                     help="Use this shot as the product's colour reference (the look "
+                          "every other shot is matched to)"):
+            name = ST.name(disp)
+            tgt = ST.join(manifest.output_root, ".hero", "products", product, name)
+            ST.write_bytes(tgt, ST.read_bytes(disp))
+            manifest.product_heroes[product] = tgt
+            M.save(manifest, ST)
+            st.toast("Reference set.", icon=":material/center_focus_strong:")
             st.rerun()
     with oc:
         st.button("⤢", key=f"gopen::{vkey}", use_container_width=True,
-                  help="Fine-tune this image in the detail view",
+                  help="Fine-tune this one shot in the detail view",
                   on_click=_cb_open_detail_variant, args=(photo.photo_id,))
-    tag = ("<span class='badge' style='background:var(--accent-muted);color:var(--accent);'>★ hero</span>"
-           if is_hero else ("<span class='badge badge-ready'>✓ graded</span>" if graded
-                            else "<span class='subtle' style='font-size:11px;'>raw</span>"))
+    tag = ("<span class='badge badge-ready'>✓ graded</span>" if graded
+           else "<span class='subtle' style='font-size:11px;'>raw</span>")
     st.markdown(f"<div style='margin-top:2px;'>{tag}</div>", unsafe_allow_html=True)
 
 
 def render_grade_workspace(manifest: M.Manifest, product: str,
                            photos: list, is_worn: bool, cols_per_row: int) -> None:
-    """Stage 2 for a product: set a hero (grade one image), tune the grade settings,
-    then Harmonize all the product's images to that hero."""
+    """Stage 2 for a product, as one linear flow:
+      Step 1 — set the look: adjust the controls (and optionally pick a colour
+               reference); a live preview shows the look on one shot.
+      Step 2 — Apply to all: grade every shot with that look and save the graded
+               versions to <product>/renders/. Nothing is saved until Apply.
+    A 'Show graded only' toggle turns the grid into a harmony review."""
     tiles = [(ph, v) for ph in photos for v in ph.kept_variants]
-    hero = manifest.product_heroes.get(product)
-    hero_ok = bool(hero and _exists_cached(hero))
+    n_graded = sum(1 for ph, v in tiles if ph.is_graded(v))
+    sample = photos[0] if photos else None
+    ref = P.hero_path_for_photo(cfg, manifest, sample) if sample else None
+    ref_ok = bool(ref and _exists_cached(ref))
+    explicit_none = (product in manifest.product_heroes) and not manifest.product_heroes.get(product)
     hkey = f"harmonize::{product}"
     hfut = st.session_state.get("pending_grades", {}).get(hkey)
     harmonizing = hfut is not None and not hfut.done()
 
-    top_l, top_r = st.columns([3, 2], vertical_alignment="center")
-    with top_l:
-        d = _product_grade_defaults(manifest, product, is_worn)
-        with st.popover("🎚 Grade settings", use_container_width=True):
-            st.slider("Colour-match strength", 0, 100, int(d["strength"]), key=f"gp_str_{product}")
-            st.slider("Background warmth", -10, 10, int(d["warmth"]), key=f"gp_warm_{product}")
-            st.slider("Gold saturation", -30, 30, int(d["gold"]), key=f"gp_gold_{product}")
-            st.slider("Diamond cool", 0, 20, int(d["cool"]), key=f"gp_cool_{product}")
-            st.checkbox("Whiten background", value=bool(d["whiten"]), key=f"gp_white_{product}")
-            if st.button("Save settings", key=f"gp_save_{product}", use_container_width=True):
-                manifest.product_grade_params[product] = {
-                    "strength": int(st.session_state[f"gp_str_{product}"]),
-                    "warmth": int(st.session_state[f"gp_warm_{product}"]),
-                    "gold": int(st.session_state[f"gp_gold_{product}"]),
-                    "cool": int(st.session_state[f"gp_cool_{product}"]),
-                    "whiten": bool(st.session_state[f"gp_white_{product}"]),
-                }
+    d = _product_grade_defaults(manifest, product, is_worn)
+    ctrl, prev = st.columns([3, 2], gap="medium")
+    with ctrl:
+        st.markdown("**Step 1 · Set the look**")
+        c_str = st.slider("Colour-match strength", 0, 100, int(d["strength"]),
+                          key=f"gp_str_{product}",
+                          help="How strongly to match the reference's colour. "
+                               "0 (or no reference) = controls only, no colour match.")
+        c_warm = st.slider("Background warmth", -10, 10, int(d["warmth"]), key=f"gp_warm_{product}")
+        c_gold = st.slider("Gold saturation", -30, 30, int(d["gold"]), key=f"gp_gold_{product}")
+        c_cool = st.slider("Diamond cool", 0, 20, int(d["cool"]), key=f"gp_cool_{product}")
+        c_white = st.checkbox("Whiten background", value=bool(d["whiten"]), key=f"gp_white_{product}")
+
+        # Reference status + management
+        if ref_ok:
+            st.caption(f"Colour reference: `{ST.name(ref)}`")
+        elif explicit_none:
+            st.caption("Colour reference: **none** — controls only.")
+        else:
+            st.caption("Colour reference: project default."
+                       if manifest.hero_path else "Colour reference: **none** — controls only.")
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            rup = st.file_uploader("Upload reference", type=["png", "jpg", "jpeg", "webp"],
+                                   key=f"gpref_up_{product}", label_visibility="collapsed")
+            if rup is not None:
+                _m = f"__gpref_done_{product}"
+                if st.session_state.get(_m) != rup.file_id:
+                    tgt = ST.join(manifest.output_root, ".hero", "products", product, rup.name)
+                    ST.write_bytes(tgt, rup.getvalue())
+                    manifest.product_heroes[product] = tgt
+                    st.session_state[_m] = rup.file_id
+                    M.save(manifest, ST)
+                    st.rerun()
+        with rc2:
+            if st.button("✖ No reference", key=f"gpref_none_{product}", use_container_width=True,
+                         disabled=explicit_none,
+                         help="Grade with the controls only — no colour matching"):
+                manifest.product_heroes[product] = ""   # explicit none
                 M.save(manifest, ST)
-                st.toast("Grade settings saved.", icon=":material/tune:")
-    with top_r:
-        if st.button("✨ Harmonize all → hero", key=f"harm_{product}", type="primary",
-                     use_container_width=True, disabled=(not hero_ok) or harmonizing,
-                     help="Set a hero first" if not hero_ok
-                          else "Grade every image of this product to match the hero"):
+                st.rerun()
+        st.caption("Or click **◎ Reference** under any shot below to match the set to it.")
+    with prev:
+        st.markdown("**Preview**")
+        if tiles:
+            sph, sv = tiles[0]
+            try:
+                loc = _local(sv); mt = loc.stat().st_mtime
+                hero_loc = str(_local(ref)) if ref_ok else None
+                pk = (int(c_str), 1 if c_white else 0, int(c_warm), int(c_gold), int(c_cool))
+                with st.spinner("Previewing…"):
+                    pb = _cached_preview(str(loc), mt, sph.classification or "packshot", hero_loc, pk)
+                st.image(pb, use_container_width=True)
+                st.caption(f"The look on `{ST.name(sv)}` — **not saved yet**.")
+            except Exception:
+                st.caption("_(preview unavailable)_")
+
+    st.markdown("**Step 2 · Apply to the whole product**")
+    ap, tg = st.columns([3, 2], vertical_alignment="center")
+    with ap:
+        if st.button(f"✨ Apply grade to all {len(tiles)} shots", key=f"harm_{product}",
+                     type="primary", use_container_width=True,
+                     disabled=harmonizing or not tiles):
+            manifest.product_grade_params[product] = {
+                "strength": int(c_str), "warmth": int(c_warm), "gold": int(c_gold),
+                "cool": int(c_cool), "whiten": bool(c_white),
+            }
+            M.save(manifest, ST)
             pend = st.session_state.setdefault("pending_grades", {})
             pend[hkey] = P.submit_harmonize_product(cfg, manifest, product)
             st.rerun()
-
+    with tg:
+        show_graded = st.toggle("Show graded only", value=(n_graded > 0),
+                                key=f"gradedonly_{product}",
+                                help="Review the harmonised set on its own")
     if harmonizing:
-        st.caption("⚙ Harmonizing the product to its hero…")
-    elif hero_ok:
-        st.caption(f"Hero: `{ST.name(hero)}` — set one image as ★ Hero, tune settings, "
-                   f"then Harmonize the rest to match.")
+        st.caption("⚙ Applying the grade to every shot and saving to the render folder…")
     else:
-        st.caption("Set one image as ★ Hero to define the look, then Harmonize the rest to it.")
+        st.caption("**Apply** grades every shot with the look above and saves the graded "
+                   "versions to `<product>/renders/`. Nothing is saved until you click it.")
 
-    for row_start in range(0, len(tiles), cols_per_row):
+    grid = [(ph, v) for ph, v in tiles if (not show_graded) or ph.is_graded(v)]
+    if show_graded and not grid:
+        st.caption("No graded shots yet — click **Apply** to grade the set.")
+    for row_start in range(0, len(grid), cols_per_row):
         cols = st.columns(cols_per_row, gap="small")
-        for i, (ph, v) in enumerate(tiles[row_start:row_start + cols_per_row]):
+        for i, (ph, v) in enumerate(grid[row_start:row_start + cols_per_row]):
             with cols[i]:
                 render_grade_tile(manifest, product, ph, v)
 
@@ -3513,11 +3566,13 @@ def render_photo_card(photo: M.PhotoState):
                 else:
                     st.caption("No hero — set one to colour-match the renders to it; "
                                "without one, grading only normalises the background.")
+                _ref_none = (photo.product in manifest.product_heroes
+                             and not manifest.product_heroes.get(photo.product))
                 hb1, hb2 = st.columns(2)
                 with hb1:
                     if st.button("📌 Use this", key=f"usehero_{photo.photo_id}",
                                  use_container_width=True,
-                                 help="Set this product's hero to the option on the left"):
+                                 help="Use the option on the left as this product's colour reference"):
                         name = ST.name(disp)
                         tgt = ST.join(manifest.output_root, ".hero", "products", photo.product, name)
                         ST.write_bytes(tgt, ST.read_bytes(disp))
@@ -3526,10 +3581,10 @@ def render_photo_card(photo: M.PhotoState):
                         M.save(manifest, ST)
                         st.rerun()
                 with hb2:
-                    if hero_resolved and st.button("✖ Clear", key=f"clrhero2_{photo.photo_id}",
-                                                   use_container_width=True,
-                                                   help="Remove this product's hero override"):
-                        manifest.product_heroes.pop(photo.product, None)
+                    if st.button("✖ No reference", key=f"clrhero2_{photo.photo_id}",
+                                 use_container_width=True, disabled=_ref_none,
+                                 help="Grade this product with controls only — no colour match"):
+                        manifest.product_heroes[photo.product] = ""   # explicit none
                         _apply_hero_preset(manifest, photo, False)
                         M.save(manifest, ST)
                         st.rerun()
