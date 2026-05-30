@@ -65,6 +65,10 @@ class Manifest:
     # path stored here INSTEAD of `hero_path`. Useful when one product needs a
     # different color reference (e.g. mixed metals across the catalog).
     product_heroes: dict[str, str] = field(default_factory=dict)
+    # Cached folder discovery: [[product, image_path], ...]. Populated by ingest so a
+    # re-open doesn't re-list every product folder on the backend (slow on Dropbox).
+    # Refreshed only when the user invokes "Rescan folder".
+    discovered: list = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(
@@ -79,6 +83,7 @@ class Manifest:
                 "product_briefs": self.product_briefs,
                 "product_classifications": self.product_classifications,
                 "product_heroes": self.product_heroes,
+                "discovered": self.discovered,
             },
             indent=2,
         )
@@ -98,6 +103,7 @@ class Manifest:
             product_briefs=dict(obj.get("product_briefs", {})),
             product_classifications=dict(obj.get("product_classifications", {})),
             product_heroes=dict(obj.get("product_heroes", {})),
+            discovered=list(obj.get("discovered", [])),
         )
 
 

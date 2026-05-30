@@ -99,6 +99,41 @@ def _persist(cfg: Config, manifest: M.Manifest) -> None:
     st.write_text(M.manifest_path(st, manifest.output_root), data)
 
 
+# ── Persisted thumbnails ─────────────────────────────────────────────────
+# Board/gallery speed: instead of downloading every full-res 2K image and
+# decoding it on first paint, we persist a small JPEG (~512px, ~30KB) next to the
+# outputs under `<output_root>/.thumbs/<sha>.jpg` whenever an image is written. The
+# board reads those tiny files; full-res is fetched only on demand (detail/zoom).
+THUMB_MAX_EDGE = 512
+THUMB_QUALITY = 80
+
+
+def thumb_storage_path(st: Storage, output_root: str, src_path: str) -> str:
+    """Stable storage path for the small thumbnail of `src_path`."""
+    key = hashlib.sha256(str(src_path).encode("utf-8")).hexdigest()[:20]
+    return st.join(output_root, ".thumbs", f"{key}.jpg")
+
+
+def write_thumb(st: Storage, output_root: str, src_path: str, src_bytes: bytes,
+                max_edge: int = THUMB_MAX_EDGE) -> Optional[str]:
+    """Encode + persist a small JPEG thumbnail of `src_bytes`. Returns the thumb
+    storage path, or None on failure (never raises — thumbnails are best-effort)."""
+    try:
+        import io
+        from PIL import Image as _PI
+        img = _PI.open(io.BytesIO(src_bytes)).convert("RGB")
+        if max(img.size) > max_edge:
+            s = max_edge / max(img.size)
+            img = img.resize((int(img.size[0] * s), int(img.size[1] * s)), _PI.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=THUMB_QUALITY, optimize=True)
+        tp = thumb_storage_path(st, output_root, src_path)
+        st.write_bytes(tp, buf.getvalue())
+        return tp
+    except Exception:
+        return None
+
+
 def _get_executor() -> ThreadPoolExecutor:
     """Lazily create the variant-regenerate executor — 4 workers means up to 4 photos
     regenerate in parallel (each spawns its own internal pool for variants)."""
@@ -170,12 +205,17 @@ def ingest(
     brand_root: str,
     output_root: str,
     project: Optional[Project] = None,
+    force_rescan: bool = False,
 ) -> M.Manifest:
     """Build (or top-up) manifest from the brand folder.
 
     If `project` is supplied, its per-product briefs and classifications are written
     into the manifest, and new photos get their `classification` and `brief_notes`
     pre-filled from the matching ProductGroup — no Claude vision call needed.
+
+    Folder discovery is cached on the manifest (`discovered`). A normal open reuses
+    that cache (no backend listing); pass `force_rescan=True` (the "Rescan folder"
+    action) to re-list and pick up newly-added renders.
     """
     st = get_storage(cfg)
     brand_root = str(brand_root)
@@ -204,7 +244,18 @@ def ingest(
             manifest.product_classifications = classes
             dirty = True
 
-    for product, img in discover_images(cfg, brand_root):
+    # Discovery: reuse the cached list unless asked to rescan (listing every product
+    # folder on Dropbox is the slow part of opening). Cache is [[product, path], ...].
+    if manifest.discovered and not force_rescan:
+        discovered = [(p, img) for p, img in manifest.discovered]
+    else:
+        discovered = discover_images(cfg, brand_root)
+        new_cache = [[p, img] for p, img in discovered]
+        if new_cache != manifest.discovered:
+            manifest.discovered = new_cache
+            dirty = True
+
+    for product, img in discovered:
         rel_under_brand = st.relpath(img, brand_root)
         out_path = st.join(output_root, rel_under_brand)
         photo_id = f"{product}/{st.name(img)}"
@@ -469,6 +520,7 @@ def generate_variants_for(
             continue
         vp = st.join(vdir, f"variant_{i + 1:03d}.png")
         st.write_bytes(vp, r.image_bytes)
+        write_thumb(st, manifest.output_root, vp, r.image_bytes)  # persist a fast board thumbnail
         paths.append(vp)
 
     # Lock the manifest mutation + save so parallel regenerates on different photos
@@ -594,6 +646,7 @@ def select_variant(
 
     graded = grade_image(src_bytes, photo.classification or "packshot", hero_rgb=hero_rgb)
     st.write_bytes(photo.output_path, graded)
+    write_thumb(st, manifest.output_root, photo.output_path, graded)  # refresh the board thumbnail
 
     with _MANIFEST_LOCK:
         photo.selected_variant = variant_path

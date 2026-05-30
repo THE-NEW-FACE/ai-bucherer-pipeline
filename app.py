@@ -1042,15 +1042,106 @@ def _cached_thumb_bytes(path_str: str, mtime: float, max_edge: int) -> bytes:
 
 
 def _board_thumb(path, max_edge: int = 500):
-    """A small cached JPEG (bytes) for st.image on the board. Falls back to the raw
-    local path if thumbnailing fails, so a card always renders something."""
+    """Small JPEG bytes for st.image. Prefers the persisted ~512px thumbnail under
+    `<output_root>/.thumbs` (≈30 KB, no 2K download/decode); only when that's absent
+    does it fall back to downloading the full-res image, downscaling, and backfilling
+    the persisted thumb so the next render is fast. Existence is tracked in an
+    in-memory session set populated by `_prefetch_thumbs`, so the board never does a
+    per-tile network probe."""
+    mf = st.session_state.get("manifest")
+    if mf is not None:
+        tp = P.thumb_storage_path(ST, mf.output_root, str(path))
+        present = st.session_state.get("__thumbs_present", set())
+        if tp in present or Path(tp).exists():
+            try:
+                return _local(tp).read_bytes()
+            except Exception:
+                pass
+
     local = _local(path)
     try:
         mtime = local.stat().st_mtime
     except OSError:
         mtime = 0.0
     data = _cached_thumb_bytes(str(local), mtime, max_edge)
+    if data and mf is not None:
+        try:
+            tp2 = P.write_thumb(ST, mf.output_root, str(path), local.read_bytes())
+            if tp2:
+                st.session_state.setdefault("__thumbs_present", set()).add(tp2)
+        except Exception:
+            pass
     return data if data else str(local)
+
+
+def _prefetch_thumbs(display_paths) -> None:
+    """Warm persisted thumbnails for the board in one parallel batch and record which
+    exist in `st.session_state['__thumbs_present']`, so `_board_thumb` resolves each
+    tile from memory (no per-tile network probe). For paths whose thumb is missing,
+    warm the full-res image so the per-tile downscale+backfill is fast."""
+    mf = st.session_state.get("manifest")
+    if mf is None:
+        return
+    present = st.session_state.setdefault("__thumbs_present", set())
+    pairs = [(str(p), P.thumb_storage_path(ST, mf.output_root, str(p)))
+             for p in display_paths if p]
+    if getattr(ST, "backend", "local") != "dropbox":
+        for src, tp in pairs:
+            if Path(tp).exists():
+                present.add(tp)
+        missing = [src for src, tp in pairs if tp not in present]
+        _prefetch_materialize(missing)
+        return
+
+    def _one(args):
+        src, tp = args
+        try:
+            ST.materialize(tp)   # download thumb to local cache; raises if it doesn't exist
+            return tp, True
+        except Exception:
+            return tp, False
+
+    todo = [(src, tp) for src, tp in pairs if tp not in present]
+    if todo:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for tp, ok in ex.map(_one, todo):
+                if ok:
+                    present.add(tp)
+    missing = [src for src, tp in pairs if tp not in present]
+    _prefetch_materialize(missing)
+
+
+def _build_all_thumbs(manifest) -> int:
+    """One-shot: persist a thumbnail for every current variant + graded output that
+    doesn't have one yet. Parallelized, idempotent. Returns the count built."""
+    targets: list[str] = []
+    for p in manifest.photos.values():
+        targets.extend(p.variants or [])
+        if p.graded:
+            targets.append(p.output_path)
+    targets = list(dict.fromkeys(str(t) for t in targets if t))
+    present = st.session_state.setdefault("__thumbs_present", set())
+
+    def _one(src: str) -> int:
+        tp = P.thumb_storage_path(ST, manifest.output_root, src)
+        try:
+            if _exists_cached(tp):
+                present.add(tp)
+                return 0
+            tp2 = P.write_thumb(ST, manifest.output_root, src, ST.read_bytes(src))
+            if tp2:
+                present.add(tp2)
+                return 1
+        except Exception:
+            return 0
+        return 0
+
+    built = 0
+    if targets:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for n in ex.map(_one, targets):
+                built += n
+    return built
 
 
 def _folder_images(folder: str) -> list[str]:
@@ -1642,6 +1733,29 @@ def render_sidebar():
                             M.save(manifest, ST)
                             st.toast(f"Hero set for {pg.folder_name}", icon="📌")
                             st.rerun()
+
+        # Maintenance — discovery cache refresh + thumbnail pre-build
+        if project and manifest:
+            _sb_section("Maintenance")
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                if st.button("↻ Rescan folder", use_container_width=True, key="rescan_folder",
+                             help="Re-list the render folders to pick up newly added renders "
+                                  "(normal open uses a cached list for speed)"):
+                    st.session_state["manifest"] = P.ingest(
+                        cfg, project.brand_root, project.output_root,
+                        project=project, force_rescan=True,
+                    )
+                    st.toast("Folder rescanned.", icon="🔄")
+                    st.rerun()
+            with mc2:
+                if st.button("⚡ Build thumbnails", use_container_width=True, key="build_thumbs",
+                             help="Pre-generate the fast board thumbnails for every current "
+                                  "visual (makes the next open instant)"):
+                    with st.spinner("Building thumbnails…"):
+                        n = _build_all_thumbs(manifest)
+                    st.toast(f"Built {n} thumbnail(s).", icon="⚡")
+                    st.rerun()
 
         # Keys + model
         st.markdown("---")
@@ -2424,15 +2538,15 @@ def render_board_page():
     card_size = st.session_state.get("board_card_size", "Medium")
     cols_per_row = _board_cols_for_size(card_size)
 
-    # Warm the download cache for every card's display image in parallel. On the
-    # Dropbox backend this turns the first paint from 25 sequential downloads into
-    # a handful of concurrent batches; once warm it's just cheap local stats.
-    _prefetch_materialize(
+    # Warm persisted thumbnails (≈30 KB each) for every card's display image in one
+    # parallel batch — instead of downloading + decoding full-res 2K images. This is
+    # the main lever that turns project open from minutes into seconds on Dropbox.
+    _prefetch_thumbs([
         photo.output_path if photo.graded
         else (photo.variants[_current_board_variant(photo)] if photo.variants
               else photo.input_path)
         for photo in manifest.photos.values()
-    )
+    ])
 
     for product_name in ordered_keys:
         photos = products[product_name]
