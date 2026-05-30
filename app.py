@@ -1260,8 +1260,7 @@ def _build_all_thumbs(manifest) -> int:
     targets: list[str] = []
     for p in manifest.photos.values():
         targets.extend(p.variants or [])
-        if p.graded:
-            targets.append(p.output_path)
+        targets.extend((p.graded_variants or {}).values())
     targets = list(dict.fromkeys(str(t) for t in targets if t))
     present = st.session_state.setdefault("__thumbs_present", set())
 
@@ -1592,7 +1591,7 @@ def _init_session_state():
     st.session_state.setdefault("project", None)
     st.session_state.setdefault("detail_photo_id", None)
     # Per-photo board variant index is stored under flat `vidx::<photo_id>` keys
-    # (see _vidx_key / _current_board_variant). No nested dict — Streamlit
+    # (per-photo widget sync). No nested dict — Streamlit
     # tracks mutations more reliably with top-level keys.
 
 
@@ -1712,7 +1711,7 @@ def render_sidebar():
         _sb_section("Stats")
         if manifest:
             n_photos = len(manifest.photos)
-            n_graded = sum(1 for p in manifest.photos.values() if p.graded)
+            n_graded = sum(1 for p in manifest.photos.values() if p.has_graded)
             n_ready = sum(1 for p in manifest.photos.values() if p.variants)
             pct = (n_graded / n_photos * 100) if n_photos else 0
             st.markdown(
@@ -1739,34 +1738,37 @@ def render_sidebar():
                 unsafe_allow_html=True,
             )
 
-        # Hero
+        # Project colour reference (the default target every product converges to,
+        # unless a product sets its own reference in the Grade stage).
         if manifest:
             st.markdown("---")
-            st.header("Hero (grading reference)")
+            st.header("Project colour reference")
             st.caption(
-                "Color reference all graded outputs match against. Without a hero, "
-                "grading only normalizes the background."
+                "The default target shots converge toward. Each product can override "
+                "this with its own reference in the Grade stage. Without any reference, "
+                "grading only normalises the background."
             )
             hero_upload = st.file_uploader(
-                "Upload hero",
+                "Upload reference",
                 type=["png", "jpg", "jpeg", "webp"],
                 key="sidebar_hero_uploader",
             )
             if hero_upload is not None and st.button(
-                "📌 Set as hero", key="set_hero_btn", use_container_width=True,
+                "📌 Set as project reference", key="set_hero_btn", use_container_width=True,
             ):
                 hero_target = ST.join(manifest.output_root, ".hero", hero_upload.name)
                 ST.write_bytes(hero_target, hero_upload.getvalue())
                 manifest.hero_path = hero_target
                 manifest.hero_photo_id = None
                 M.save(manifest, ST)
-                st.success(f"Hero set to {hero_upload.name}")
+                st.success(f"Project reference set to {hero_upload.name}")
                 st.rerun()
 
             if manifest.hero_path:
                 if _exists_cached(manifest.hero_path):
                     hero_name = ST.name(manifest.hero_path)
-                    st.image(str(_local(manifest.hero_path)), width=200, caption=f"Hero: {hero_name}")
+                    st.image(str(_local(manifest.hero_path)), width=200,
+                             caption=f"Reference: {hero_name}")
                     hc1, hc2 = st.columns(2)
                     with hc1:
                         if st.button("Clear", key="clear_hero_btn", use_container_width=True):
@@ -1775,17 +1777,20 @@ def render_sidebar():
                             M.save(manifest, ST)
                             st.rerun()
                     with hc2:
-                        if st.button("Re-grade all", key="regrade_all_btn", use_container_width=True,
-                                     help="Re-run the harmonizer on every picked variant. Free."):
-                            n = P.regrade_all_selected(cfg, manifest)
-                            st.success(f"Re-graded {n} photo(s).")
+                        if st.button("↻ Re-converge all", key="regrade_all_btn",
+                                     use_container_width=True,
+                                     help="Re-run convergence on every already-graded "
+                                          "product against its reference. Free."):
+                            with st.spinner("Re-converging…"):
+                                n = P.converge_all_graded(cfg, manifest)
+                            st.success(f"Re-converged {n} shot(s).")
                             st.rerun()
                 else:
-                    st.warning(f"Hero file missing: {manifest.hero_path}")
+                    st.warning(f"Reference file missing: {manifest.hero_path}")
             else:
-                st.warning("No hero set — grading is background-only.")
+                st.caption("No project reference — set one here, or per product in Grade.")
 
-        # Project settings (briefs + per-product hero override)
+        # Project settings (product descriptions)
         if project:
             _sb_section("Project settings")
 
@@ -1811,66 +1816,6 @@ def render_sidebar():
                         manifest.product_briefs = project.product_brief_map()
                         M.save(manifest, ST)
                     st.toast("Saved.", icon="💾")
-
-            with st.expander("Per-product hero overrides", expanded=False):
-                st.caption(
-                    "Each product can use a different grading reference. If no "
-                    "override is set, the photo grades against the project-wide hero."
-                )
-                if not manifest:
-                    st.markdown("<div class='subtle'>Open a project to manage overrides.</div>",
-                                unsafe_allow_html=True)
-                else:
-                    for pg in project.products:
-                        current_path = manifest.product_heroes.get(pg.folder_name)
-                        current_ok = bool(current_path and _exists_cached(current_path))
-                        # Per-product card
-                        st.markdown(
-                            f"<div style='font-size:12px;font-weight:600;color:var(--text);"
-                            f"margin:10px 0 4px 0;'>{pg.folder_name}</div>",
-                            unsafe_allow_html=True,
-                        )
-                        if current_ok:
-                            ph1, ph2 = st.columns([2, 1])
-                            with ph1:
-                                # Thumbnail of the current override
-                                url = _image_to_data_url(current_path, max_edge=160)
-                                st.markdown(
-                                    f"<img src='{url}' style='width:100%;max-width:160px;"
-                                    f"aspect-ratio:1/1;object-fit:cover;border-radius:6px;"
-                                    f"border:1px solid var(--border-subtle);' "
-                                    f"title='{ST.name(current_path)}'/>",
-                                    unsafe_allow_html=True,
-                                )
-                            with ph2:
-                                if st.button("Clear", key=f"clearhero_{pg.folder_name}",
-                                             use_container_width=True,
-                                             help="Fall back to the project-wide hero"):
-                                    manifest.product_heroes.pop(pg.folder_name, None)
-                                    M.save(manifest, ST)
-                                    st.rerun()
-                        else:
-                            st.markdown(
-                                "<div class='subtle' style='font-size:11px;margin-bottom:6px;'>"
-                                "Using project default. Upload an override:</div>",
-                                unsafe_allow_html=True,
-                            )
-
-                        up = st.file_uploader(
-                            "Upload hero", type=["png", "jpg", "jpeg", "webp"],
-                            key=f"heroup_{pg.folder_name}",
-                            label_visibility="collapsed",
-                        )
-                        if up is not None and st.button(
-                            "Set as override", key=f"setoverhero_{pg.folder_name}",
-                            use_container_width=True,
-                        ):
-                            target = ST.join(manifest.output_root, ".hero", pg.folder_name, up.name)
-                            ST.write_bytes(target, up.getvalue())
-                            manifest.product_heroes[pg.folder_name] = target
-                            M.save(manifest, ST)
-                            st.toast(f"Hero set for {pg.folder_name}", icon="📌")
-                            st.rerun()
 
         # Maintenance — thumbnail pre-build (Rescan lives in the identity block above)
         if project and manifest:
@@ -2278,230 +2223,10 @@ def _board_cols_for_size(size: str) -> int:
     return {"Small": 5, "Medium": 4, "Large": 3}.get(size, 4)
 
 
-def _vidx_key(photo: M.PhotoState) -> str:
-    """Session-state key holding the displayed variant index for a photo on the board.
-    Flat keys (not a nested dict) avoid any Streamlit edge cases around dict-mutation
-    persistence across reruns."""
-    return f"vidx::{photo.photo_id}"
-
-
-def _current_board_variant(photo: M.PhotoState) -> int:
-    """Which variant index is currently displayed for this photo on the board.
-    Reads from a per-photo flat key in st.session_state.
-
-    Falls back to the photo's selected variant (if any) or 0 when no index is
-    stored, or when the stored index is out of range for the current variant list.
-    """
-    key = _vidx_key(photo)
-    if key in st.session_state:
-        idx = st.session_state[key]
-        if isinstance(idx, int) and 0 <= idx < max(len(photo.variants), 1):
-            return idx
-    if photo.selected_variant and photo.selected_variant in photo.variants:
-        idx = photo.variants.index(photo.selected_variant)
-    else:
-        idx = 0
-    st.session_state[key] = idx
-    return idx
-
-
-def _set_board_variant(photo: M.PhotoState, idx: int) -> None:
-    """Write the per-photo displayed variant index. Used by the ◀/▶ click handlers
-    and by _handle_select to keep the board card in sync with the picked variant."""
-    st.session_state[_vidx_key(photo)] = idx
-
-
-# ── Module-level button callbacks ────────────────────────────────────────
-# Defined at module scope (not inside render_board_card) so each st.button's
-# on_click binds to a stable function reference instead of a fresh closure
-# per render. Streamlit captures the callback by reference; closure-based
-# callbacks created on every rerun risk losing their captured variables.
-# We pass photo_id + n_variants via functools.partial to bind them explicitly.
-
-def _cb_variant_step(pid: str, n: int, delta: int) -> None:
-    """Advance (delta=+1) or retreat (delta=-1) the displayed variant for `pid`."""
-    if n <= 0:
-        return
-    key = f"vidx::{pid}"
-    cur = st.session_state.get(key, 0)
-    if not isinstance(cur, int):
-        cur = 0
-    st.session_state[key] = (cur + delta) % n
-
-
-def _cb_open_detail(pid: str) -> None:
-    """Open the detail view for `pid` (route + selection update)."""
-    st.session_state["detail_photo_id"] = pid
-    st.session_state["route"] = "detail"
-
-
-def render_board_card(photo: M.PhotoState):
-    """One card on the board: square thumbnail + variant arrows + open button.
-
-    Layout (top-to-bottom):
-      • Square 1:1 thumbnail of the current variant / graded output
-      • Tight control row (‹  chip  ›  ⤢)  — chip shows "1 / 4" or status
-      • Filename + classification + status badges
-    """
-    n_variants = len(photo.variants)
-    idx = _current_board_variant(photo)
-    overlay_path = photo.variants[idx] if n_variants > 0 else None
-
-    fut = st.session_state.get("pending_regens", {}).get(photo.photo_id)
-    is_regenerating = fut is not None and not fut.done()
-    gfut = st.session_state.get("pending_grades", {}).get(photo.photo_id)
-    is_grading = gfut is not None and not gfut.done()
-
-    # ── 1) The image (top, dominant)
-    # Show the canonical review image: the graded output if saved, otherwise the
-    # currently-selected variant, falling back to the raw input. We deliberately
-    # use a native st.image (not a per-card components.v1.html iframe): rendering
-    # 40+ custom-component iframes on one page wedges the Streamlit session so
-    # that NO widget interaction triggers a rerun — every board button silently
-    # dies. The input-vs-output compare slider lives in the detail view, where a
-    # single component instance is safe. The keyed container lets the CSS below
-    # force a square 1:1 thumbnail.
-    # `photo.graded` is the manifest's own truth that the output was written — trust
-    # it instead of a per-card filesystem/API existence probe (cheap on the board grid).
-    # Trust the manifest — no per-card existence probe. On the Dropbox backend a
-    # probe per card was 25 sequential `files_get_metadata` network calls every
-    # rerun (and every 3s autorefresh tick), which froze the board. A path listed
-    # in photo.variants exists (ingest reconciles dangling ones on load); if it
-    # somehow can't be fetched, _board_thumb falls back to a placeholder.
-    if photo.graded:
-        display_img = photo.output_path
-    elif overlay_path:
-        display_img = overlay_path
-    else:
-        display_img = photo.input_path
-
-    with st.container(key=f"boardimg-{photo.photo_id}"):
-        st.image(_board_thumb(display_img), use_container_width=True)
-
-    # ── 2) Control row — clean toolbar inspired by the Gemini variant card:
-    #     ‹  1 / 4  ›        ⤢
-    # Chevrons + inline count + fullscreen icon. When the photo has no
-    # variants we DROP the arrows entirely (instead of showing disabled
-    # squares) and the chip carries the status message ("pending"/"error"/
-    # "generating"). The button keys include n_variants so Streamlit
-    # discards the stale widget state when the variant count changes —
-    # without this, a button rendered initially disabled stays effectively
-    # disabled even after variants arrive.
-    has_nav = n_variants > 1
-    is_picked = bool(photo.selected_variant and photo.selected_variant == overlay_path)
-
-    if is_grading:
-        chip_inner = "<span style='font-weight:600;'>● grading</span>"
-        chip_class = "var-chip var-chip-running"
-    elif is_regenerating:
-        chip_inner = "<span style='font-weight:600;'>● generating</span>"
-        chip_class = "var-chip var-chip-running"
-    elif n_variants:
-        mark = " · saved" if is_picked and photo.graded else ""
-        chip_inner = f"<b style='font-variant-numeric:tabular-nums;'>{idx + 1}</b>"\
-                     f"<span style='color:var(--text-3);margin:0 4px;'>/</span>"\
-                     f"<span style='font-variant-numeric:tabular-nums;'>{n_variants}</span>"\
-                     f"{mark}"
-        chip_class = "var-chip var-chip-picked" if is_picked else "var-chip"
-    elif photo.last_error:
-        chip_inner = "error"
-        chip_class = "var-chip var-chip-empty"
-    else:
-        chip_inner = "pending"
-        chip_class = "var-chip var-chip-empty"
-
-    # Wrap the toolbar in a keyed container so the .st-key-boardctrls CSS above
-    # can actually reach the buttons (see the CSS comment for why a markdown div
-    # can't). Layout: [‹] [chip] [›]  ······  [⤢]; arrows drop when has_nav is False.
-    # The card can compare as soon as there's a rendered image distinct from the
-    # raw input (a graded output or a generated variant). display_img already
-    # encodes that choice without any extra existence probes.
-    can_compare = display_img != photo.input_path
-
-    with st.container(key=f"boardctrls-{photo.photo_id}"):
-        if has_nav:
-            cPrev, cChip, cNext, cSpacer, cCompare, cOpen = st.columns([1, 3, 1, 0.5, 1, 1])
-        else:
-            # Arrows hidden; chip takes the space.
-            cPrev = cNext = None
-            cChip, cSpacer, cCompare, cOpen = st.columns([5, 0.5, 1, 1])
-
-        # State changes go through on_click callbacks, which run before the rerun —
-        # the button's return value is intentionally ignored.
-        if has_nav and cPrev is not None:
-            with cPrev:
-                st.button(
-                    "‹", key=f"prev_{photo.photo_id}_{n_variants}",
-                    use_container_width=True,
-                    help="Previous variant",
-                    on_click=_cb_variant_step,
-                    args=(photo.photo_id, n_variants, -1),
-                )
-        with cChip:
-            st.markdown(
-                f"<div style='display:flex;justify-content:center;align-items:center;"
-                f"height:30px;'><div class='{chip_class}'>{chip_inner}</div></div>",
-                unsafe_allow_html=True,
-            )
-        if has_nav and cNext is not None:
-            with cNext:
-                st.button(
-                    "›", key=f"next_{photo.photo_id}_{n_variants}",
-                    use_container_width=True,
-                    help="Next variant",
-                    on_click=_cb_variant_step,
-                    args=(photo.photo_id, n_variants, +1),
-                )
-        with cCompare:
-            # Calling the @st.dialog directly on click matches the detail page.
-            # before = raw input render; after = the canonical display image
-            # (graded output if saved, else the current variant).
-            if st.button(
-                "🆚", key=f"cmp_board_{photo.photo_id}",
-                use_container_width=True,
-                disabled=not can_compare,
-                help="Compare input ↔ result" if can_compare else "Nothing to compare yet",
-            ):
-                _show_comparison(
-                    before_path=photo.input_path,
-                    after_path=display_img,
-                    before_label="Input (3D render)",
-                    after_label="Graded" if photo.graded else "Variant",
-                    title=Path(photo.input_path).name,
-                )
-        with cOpen:
-            st.button(
-                "⤢", key=f"open_{photo.photo_id}",
-                use_container_width=True,
-                help="Open detail view",
-                on_click=_cb_open_detail,
-                args=(photo.photo_id,),
-            )
-
-    # ── 3) Filename + badges (compact footer)
-    cls = photo.classification or "packshot"
-    cls_class = "badge-worn" if cls == "worn" else "badge-packshot"
-    badges_html = f"<span class='badge {cls_class}'>{cls}</span>"
-    if photo.graded:
-        badges_html += "<span class='badge badge-ready'>saved</span>"
-    elif photo.last_error and not photo.variants:
-        # Hover shows the full error via title attribute
-        err_short = (photo.last_error or "").replace('"', "'")[:120]
-        badges_html += f"<span class='badge badge-error' title=\"{err_short}\">error</span>"
-
-    fname = Path(photo.input_path).name
-    st.markdown(
-        f"<div style='display:flex;justify-content:space-between;align-items:center;"
-        f"gap:8px;margin-top:6px;font-size:11px;'>"
-        f"<span class='subtle' style='overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
-        f"min-width:0;flex:1;' title='{fname}'>{fname}</span>"
-        f"<span class='row' style='flex-shrink:0;'>{badges_html}</span>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-
 # ── Gallery tile (one per kept variant) + its callbacks ──────────────────
+# Module-level callbacks so each st.button's on_click binds to a stable function
+# reference (Streamlit captures callbacks by reference; per-rerun closures can lose
+# their captured variables). photo_id is passed via args to bind it explicitly.
 
 def _cb_open_detail_variant(pid: str) -> None:
     st.session_state["detail_photo_id"] = pid
@@ -2574,23 +2299,33 @@ def _current_grade_params(manifest: M.Manifest, photo: M.PhotoState) -> dict:
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
-def _cached_preview(variant_local: str, mtime: float, classification: str,
-                    hero_local: str | None, params_key: tuple, max_edge: int = 1100) -> bytes:
-    """Grade a DOWNSCALED copy of the variant in-memory for a fast live preview (not
-    saved). Cached by (path, mtime, classification, hero, params) so it only recomputes
-    when something actually changes."""
-    import dataclasses
+def _decoded_rgb(path: str, mtime: float, max_edge: int):
+    """Decode + downscale an image to an RGB ndarray, cached by (path, mtime, edge).
+    Splitting this out of _cached_preview means a slider tweak re-runs only the cheap
+    LAB transform, not the expensive 2K decode — the key to a live-feeling preview."""
     import numpy as np
-    from src.grader import grade_image as _gi, Settings, PACKSHOT_PRESET, WORN_PRESET
-    img = Image.open(variant_local).convert("RGB")
+    img = Image.open(path).convert("RGB")
     if max(img.size) > max_edge:
         s = max_edge / max(img.size)
         img = img.resize((int(img.size[0] * s), int(img.size[1] * s)), Image.LANCZOS)
-    buf = BytesIO(); img.save(buf, format="PNG"); src = buf.getvalue()
+    return np.array(img)
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _cached_preview(variant_local: str, mtime: float, classification: str,
+                    hero_local: str | None, params_key: tuple, max_edge: int = 720) -> bytes:
+    """Grade a DOWNSCALED copy of the variant in-memory for a fast live preview (not
+    saved). The heavy decode is cached in _decoded_rgb, so changing a slider only re-runs
+    the millisecond LAB math. Cached by (path, mtime, classification, hero, params)."""
+    import dataclasses
+    import os as _os
+    from src.grader import grade_image as _gi, Settings, PACKSHOT_PRESET, WORN_PRESET
+    src_arr = _decoded_rgb(variant_local, mtime, max_edge)
+    buf = BytesIO(); Image.fromarray(src_arr).save(buf, format="PNG"); src = buf.getvalue()
     hero_rgb = None
     if hero_local:
         try:
-            hero_rgb = np.array(Image.open(hero_local).convert("RGB"))
+            hero_rgb = _decoded_rgb(hero_local, _os.path.getmtime(hero_local), max_edge)
         except Exception:
             hero_rgb = None
     strength, whiten, warmth, gold, cool = params_key
@@ -2750,10 +2485,10 @@ def render_grade_workspace(manifest: M.Manifest, product: str,
     ctrl, prev = st.columns([3, 2], gap="medium")
     with ctrl:
         st.markdown("**Step 1 · Set the look**")
-        c_str = st.slider("Colour-match strength", 0, 100, int(d["strength"]),
+        c_str = st.slider("Convergence strength", 0, 100, int(d["strength"]),
                           key=f"gp_str_{product}",
-                          help="How strongly to match the reference's colour. "
-                               "0 (or no reference) = controls only, no colour match.")
+                          help="How strongly each shot is pulled toward the reference's "
+                               "colour. 0 (or no reference) = controls only.")
         c_warm = st.slider("Background warmth", -10, 10, int(d["warmth"]), key=f"gp_warm_{product}")
         c_gold = st.slider("Gold saturation", -30, 30, int(d["gold"]), key=f"gp_gold_{product}")
         c_cool = st.slider("Diamond cool", 0, 20, int(d["cool"]), key=f"gp_cool_{product}")
@@ -2796,36 +2531,44 @@ def render_grade_workspace(manifest: M.Manifest, product: str,
                 loc = _local(sv); mt = loc.stat().st_mtime
                 hero_loc = str(_local(ref)) if ref_ok else None
                 pk = (int(c_str), 1 if c_white else 0, int(c_warm), int(c_gold), int(c_cool))
-                with st.spinner("Previewing…"):
-                    pb = _cached_preview(str(loc), mt, sph.classification or "packshot", hero_loc, pk)
+                pb = _cached_preview(str(loc), mt, sph.classification or "packshot", hero_loc, pk)
                 st.image(pb, use_container_width=True)
                 st.caption(f"The look on `{ST.name(sv)}` — **not saved yet**.")
             except Exception:
                 st.caption("_(preview unavailable)_")
 
-    st.markdown("**Step 2 · Apply to the whole product**")
+    st.markdown("**Step 2 · Converge the whole product**")
+    can_converge = bool(tiles) and (ref_ok or is_worn)
     ap, tg = st.columns([3, 2], vertical_alignment="center")
     with ap:
-        if st.button(f"✨ Apply grade to all {len(tiles)} shots", key=f"harm_{product}",
-                     type="primary", use_container_width=True,
-                     disabled=harmonizing or not tiles):
+        label = (f"✨ Normalise all {len(tiles)} shots" if (is_worn and not ref_ok)
+                 else f"✨ Converge all {len(tiles)} shots → reference")
+        if st.button(label, key=f"harm_{product}", type="primary", use_container_width=True,
+                     disabled=harmonizing or not can_converge,
+                     help=("Set a reference first — grade one shot, then click ◎ Reference"
+                           if not can_converge else
+                           "Colour-match every shot to the reference so the set is consistent")):
             manifest.product_grade_params[product] = {
                 "strength": int(c_str), "warmth": int(c_warm), "gold": int(c_gold),
                 "cool": int(c_cool), "whiten": bool(c_white),
             }
             M.save(manifest, ST)
             pend = st.session_state.setdefault("pending_grades", {})
-            pend[hkey] = P.submit_harmonize_product(cfg, manifest, product)
+            pend[hkey] = P.submit_converge_product(cfg, manifest, product)
             st.rerun()
     with tg:
         show_graded = st.toggle("Show graded only", value=(n_graded > 0),
                                 key=f"gradedonly_{product}",
-                                help="Review the harmonised set on its own")
+                                help="Review the converged set on its own")
     if harmonizing:
-        st.caption("⚙ Applying the grade to every shot and saving to the render folder…")
+        st.caption("⚙ Converging every shot to the reference and saving to the render folder…")
+    elif not can_converge:
+        st.caption("Pick the best shot, grade it, then **◎ Reference** under it — that becomes "
+                   "the target every other shot converges to.")
     else:
-        st.caption("**Apply** grades every shot with the look above and saves the graded "
-                   "versions to `<product>/renders/`. Nothing is saved until you click it.")
+        st.caption("**Converge** colour-matches every shot to the reference (each gets its own "
+                   "correction) and saves the graded versions to `<product>/renders/`. "
+                   "Nothing is saved until you click it.")
 
     grid = [(ph, v) for ph, v in tiles if (not show_graded) or ph.is_graded(v)]
     if show_graded and not grid:
@@ -3120,81 +2863,6 @@ def render_board_page():
 
 # ═══ Route: DETAIL (per-photo card; click-from-board) ════════════════════
 
-def _render_product_hero_controls(manifest: M.Manifest, photo: M.PhotoState) -> None:
-    """Per-product grading reference (hero) controls, shown on the detail page.
-
-    The active hero for a photo is resolved per-product override → project-wide
-    default → none (see pipeline.hero_path_for_photo). This block lets the user
-    set the product override from the current graded output, upload an external
-    reference, or clear the override so the product falls back to the project hero.
-    """
-    product = photo.product
-    with st.expander("🎯 Grading reference (hero)", expanded=False):
-        st.caption(
-            "Packshots colour-match to this hero (strength 0.7). Worn shots are "
-            "background-normalised only. A per-product hero overrides the project hero."
-        )
-        per_prod = manifest.product_heroes.get(product)
-        if per_prod:
-            active = f"product override · `{ST.name(per_prod)}`"
-        elif manifest.hero_path:
-            active = f"project hero · `{ST.name(manifest.hero_path)}`"
-        else:
-            active = "none — background-only grading"
-        st.markdown(f"**Active for `{product}`:** {active}")
-
-        effective = P.hero_path_for_photo(cfg, manifest, photo)
-        if effective and _exists_cached(effective):
-            st.image(_board_thumb(effective, max_edge=180), width=180)
-
-        # Most-recent graded output for this photo (if any) → can become the hero.
-        graded_out = next(reversed(list(photo.graded_variants.values())), None) if photo.graded_variants else None
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button(
-                f"📌 Use a graded output as hero for this product",
-                key=f"prodhero_{photo.photo_id}",
-                use_container_width=True,
-                disabled=not graded_out,
-                help="Grade a variant first" if not graded_out
-                     else "Set this product's grading reference to a graded output",
-            ):
-                name = ST.name(graded_out)
-                tgt = ST.join(manifest.output_root, ".hero", "products", product, name)
-                ST.write_bytes(tgt, ST.read_bytes(graded_out))
-                manifest.product_heroes[product] = tgt
-                M.save(manifest, ST)
-                st.success(f"Product hero set: {name}")
-                st.rerun()
-        with c2:
-            if st.button(
-                "✖ Clear product override",
-                key=f"clrhero_{photo.photo_id}",
-                use_container_width=True,
-                disabled=not per_prod,
-                help="Fall back to the project-wide hero" if per_prod else "No override set",
-            ):
-                manifest.product_heroes.pop(product, None)
-                M.save(manifest, ST)
-                st.rerun()
-
-        up = st.file_uploader(
-            f"Upload a hero reference for `{product}`",
-            type=["png", "jpg", "jpeg", "webp"],
-            key=f"heroup_{photo.photo_id}",
-        )
-        if up is not None:
-            marker = f"__heroup_done_{photo.photo_id}"
-            if st.session_state.get(marker) != up.file_id:
-                tgt = ST.join(manifest.output_root, ".hero", "products", product, up.name)
-                ST.write_bytes(tgt, up.getvalue())
-                manifest.product_heroes[product] = tgt
-                M.save(manifest, ST)
-                st.session_state[marker] = up.file_id
-                st.success(f"Uploaded {up.name} as hero for {product}")
-                st.rerun()
-
-
 def _render_worn_product_ref_controls(manifest: M.Manifest, photo: M.PhotoState) -> None:
     """Worn shots only: pick a generated packshot as the SECOND Gemini reference.
 
@@ -3426,10 +3094,10 @@ def render_photo_card(photo: M.PhotoState):
                 st.markdown("<span class='badge badge-running'>● Regenerating…</span>", unsafe_allow_html=True)
             elif is_generating_prompt:
                 st.markdown("<span class='badge badge-running'>● Generating prompt…</span>", unsafe_allow_html=True)
-            elif photo.graded:
-                st.markdown("<span class='badge badge-ready'>✓ Saved</span>", unsafe_allow_html=True)
+            elif photo.has_graded:
+                st.markdown("<span class='badge badge-ready'>✓ Graded</span>", unsafe_allow_html=True)
             elif photo.variants:
-                st.markdown("<span class='badge'>● Pick one</span>", unsafe_allow_html=True)
+                st.markdown("<span class='badge'>● Generated</span>", unsafe_allow_html=True)
             elif photo.prompt:
                 st.markdown("<span class='badge'>● Prompt ready</span>", unsafe_allow_html=True)
             else:
@@ -3514,9 +3182,8 @@ def render_photo_card(photo: M.PhotoState):
                         hero_loc = str(_local(hero_resolved)) if hero_resolved else None
                         pk = (int(params["strength"]), 1 if params["whiten"] else 0,
                               int(params["warmth"]), int(params["gold"]), int(params["cool"]))
-                        with st.spinner("Previewing grade…"):
-                            preview_bytes = _cached_preview(str(loc), mt,
-                                                            photo.classification or "packshot", hero_loc, pk)
+                        preview_bytes = _cached_preview(str(loc), mt,
+                                                        photo.classification or "packshot", hero_loc, pk)
                     except Exception:
                         preview_bytes = None
 
@@ -3769,27 +3436,6 @@ def _handle_regenerate(
         st.rerun()
     except Exception as e:
         st.error(f"Regenerate failed: {e}")
-
-
-def _handle_select(photo: M.PhotoState, variant_path: str):
-    """Enqueue a grade in the background pool. UI returns immediately; badge shows
-    progress; autorefresh reaps the future and updates the board card to show the
-    graded output."""
-    manifest: M.Manifest = st.session_state["manifest"]
-    pending = st.session_state.setdefault("pending_grades", {})
-    existing = pending.get(photo.photo_id)
-    if existing is not None and not existing.done():
-        st.toast(f"Already grading {photo.photo_id}…", icon="⏳")
-        return
-    try:
-        fut = P.submit_grade(cfg, manifest, photo, variant_path)
-        pending[photo.photo_id] = fut
-        # Optimistically update the board's displayed variant to track the user's pick
-        if variant_path in photo.variants:
-            _set_board_variant(photo, photo.variants.index(variant_path))
-        st.rerun()
-    except Exception as e:
-        st.error(f"Grading failed to start: {e}")
 
 
 def render_detail_page():
