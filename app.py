@@ -3192,10 +3192,16 @@ def render_photo_card(photo: M.PhotoState):
                     "No hero set — background-normalised only. Set a hero below to colour-match."
                 )
                 worn = (photo.classification or "packshot") == "worn"
+                # Default the sliders from the LAST grade applied to this product (so
+                # the AD tunes once and re-applies across the set), falling back to the
+                # classification preset.
+                _base = {"strength": 0 if worn else 70, "whiten": True, "warmth": 0, "gold": 0, "cool": 0}
+                _prod = manifest.product_grade_params.get(photo.product) or {}
                 gs = st.session_state.setdefault(
-                    f"grade::{photo.photo_id}",
-                    {"strength": 0 if worn else 70, "whiten": True, "warmth": 0, "gold": 0, "cool": 0},
+                    f"grade::{photo.photo_id}", {**_base, **_prod},
                 )
+                if _prod:
+                    st.caption("Pre-filled from this product's last grade — Apply, or tweak first.")
                 gc1, gc2 = st.columns(2)
                 with gc1:
                     gs["strength"] = st.slider("Colour-match strength", 0, 100, int(gs["strength"]),
@@ -3222,6 +3228,10 @@ def render_photo_card(photo: M.PhotoState):
                         "gold_sat": float(gs["gold"]),
                         "diamond_cool": float(gs["cool"]),
                     }
+                    # Remember these as the product's default grade for the rest of
+                    # its variants (persisted so other variants pre-fill with them).
+                    manifest.product_grade_params[photo.product] = dict(gs)
+                    M.save(manifest, ST)
                     _cb_grade_variant(photo.photo_id, vp, overrides)
                     st.rerun()
                 if v_grading:
