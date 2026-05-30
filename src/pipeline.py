@@ -735,44 +735,9 @@ def hero_path_for_photo(cfg: Config, manifest: M.Manifest, photo: M.PhotoState) 
     return None
 
 
-def select_variant(
-    cfg: Config,
-    manifest: M.Manifest,
-    photo: M.PhotoState,
-    variant_path: str,
-) -> None:
-    """Grade selected variant against the relevant hero, write to output_path, mark graded.
-
-    Hero selection: per-product override → project-wide default → none.
-    Without a hero, grading falls back to background-normalization only (no color transfer).
-    """
-    if variant_path not in photo.variants:
-        raise ValueError(f"variant_path {variant_path} not in current variants for {photo.photo_id}")
-
-    st = get_storage(cfg)
-    # Variants are persisted through Storage (see generate_variants_for) — read via
-    # the backend so this works for both local disk and Dropbox.
-    src_bytes = st.read_bytes(variant_path)
-
-    hero_rgb = None
-    hero_resolved = hero_path_for_photo(cfg, manifest, photo)
-    if hero_resolved:
-        import numpy as np
-        from PIL import Image as _PI
-        hero_img = _PI.open(st.materialize(hero_resolved)).convert("RGB")
-        hero_rgb = np.array(hero_img)
-
-    graded = grade_image(src_bytes, photo.classification or "packshot", hero_rgb=hero_rgb)
-    st.write_bytes(photo.output_path, graded)
-    write_thumb(st, manifest.output_root, photo.output_path, graded)  # refresh the board thumbnail
-
-    with _MANIFEST_LOCK:
-        photo.selected_variant = variant_path
-        photo.graded = True
-    _persist(cfg, manifest)
-
-
 # ── Gallery model: keep-all variants, soft-delete, grade per variant ──────
+# (The legacy single-select `select_variant` was removed — grading now records
+#  per-variant outputs in `graded_variants` via `grade_variant`.)
 
 def _graded_output_path(st: Storage, manifest: M.Manifest,
                         photo: M.PhotoState, variant_path: str) -> str:
@@ -854,31 +819,142 @@ def grade_overrides_from_params(params: dict) -> dict:
     }
 
 
-def harmonize_product(cfg: Config, manifest: M.Manifest, product: str) -> int:
-    """Stage 2: grade every kept variant of `product` against its hero with the
-    product's saved grade params, so the set is consistent. Worn folders fall back to
-    the background-only preset automatically (grade_image picks by classification).
-    Returns the number of variants graded."""
+def product_has_reference(cfg: Config, manifest: M.Manifest, product: str) -> bool:
+    """True if the product has a usable colour reference to converge toward."""
+    for photo in manifest.photos.values():
+        if photo.product == product:
+            return hero_path_for_photo(cfg, manifest, photo) is not None
+    return False
+
+
+def converge_product(cfg: Config, manifest: M.Manifest, product: str) -> int:
+    """Stage 2 — CONVERGE: colour-match every kept variant of `product` TO the product's
+    reference, so the set ends up consistent. This is NOT a uniform offset — each image
+    gets its own correction toward the same target (grade_variant → grade_image with
+    hero_rgb = the reference; per-image Reinhard transfer). The saved grade params supply
+    the convergence strength + global finishing (warmth/gold/cool/whiten).
+
+    Requires a reference (worn folders, which grade background-only, are the exception:
+    they normalise consistently without a colour target). Returns variants graded; -1 if
+    a colour reference is required but missing."""
     params = manifest.product_grade_params.get(product) or {}
     overrides = grade_overrides_from_params(params) if params else None
+
+    photos = [p for p in manifest.photos.values() if p.product == product]
+    has_ref = any(hero_path_for_photo(cfg, manifest, p) is not None for p in photos)
+    all_worn = bool(photos) and all((p.classification or "packshot") == "worn" for p in photos)
+    if not has_ref and not all_worn:
+        return -1   # need a reference to converge colour; caller surfaces this
+
     n = 0
-    for photo in manifest.photos.values():
-        if photo.product != product:
-            continue
+    for photo in photos:
         for v in photo.kept_variants:
             try:
                 grade_variant(cfg, manifest, photo, v, overrides=overrides)
                 n += 1
             except Exception as e:
                 with _MANIFEST_LOCK:
-                    photo.last_error = f"Harmonize failed: {e}"
+                    photo.last_error = f"Converge failed: {e}"
     _persist(cfg, manifest)
     return n
 
 
-def submit_harmonize_product(cfg: Config, manifest: M.Manifest, product: str) -> Future:
-    """Run a whole-product harmonize in the background grading pool."""
-    return _get_grade_executor().submit(harmonize_product, cfg, manifest, product)
+# Back-compat alias — older callers/imports may still reference harmonize_product.
+harmonize_product = converge_product
+
+
+def converge_all_graded(cfg: Config, manifest: M.Manifest) -> int:
+    """Re-converge every product that already has graded variants (and a reference).
+    Used by the sidebar 'Re-converge all' maintenance action. Returns total graded."""
+    products = {p.product for p in manifest.photos.values() if p.has_graded}
+    total = 0
+    for product in products:
+        n = converge_product(cfg, manifest, product)
+        if n > 0:
+            total += n
+    return total
+
+
+def submit_converge_product(cfg: Config, manifest: M.Manifest, product: str) -> Future:
+    """Run a whole-product converge in the background grading pool."""
+    return _get_grade_executor().submit(converge_product, cfg, manifest, product)
+
+
+# Back-compat alias.
+submit_harmonize_product = submit_converge_product
+
+
+# ── Delivery: export starred finals to a clean 03_Final folder ────────────
+
+def _final_dir(st: Storage, output_root: str, product: str) -> str:
+    return st.join(output_root, "03_Final", product)
+
+
+def _next_version(st: Storage, dest_dir: str, base: str, ext: str) -> int:
+    """Next version number for `<base>_v###<ext>` in dest_dir (golden rule: never
+    overwrite — always a new version). Returns 1 if none exist."""
+    import re
+    hi = 0
+    pat = re.compile(rf"^{re.escape(base)}_v(\d+){re.escape(ext)}$")
+    try:
+        for f in st.list_files(dest_dir):
+            m = pat.match(st.name(f))
+            if m:
+                hi = max(hi, int(m.group(1)))
+    except Exception:
+        pass
+    return hi + 1
+
+
+def export_finals(cfg: Config, manifest: M.Manifest, project,
+                  product: Optional[str] = None) -> dict:
+    """Copy the AD's starred finals into `<output_root>/03_Final/<product>/` with TNF
+    deliverable names: `<slug>_SH{n:04d}_<packshot|worn>_v{v:03d}.<ext>`.
+
+    Shot numbers are assigned per product in 10s (SH0010, SH0020…) over the finals in
+    stable order (render filename, then variant). Versions bump rather than overwrite.
+    Records each export under `manifest.delivered[product]`. Returns {product: [paths]}.
+    """
+    from datetime import datetime
+    from .project import _slugify
+    st = get_storage(cfg)
+    slug = _slugify(project.name).lower()
+    ts = datetime.now().isoformat(timespec="seconds")
+
+    # Group photos by product (optionally a single one), preserving render order.
+    by_product: dict[str, list[M.PhotoState]] = {}
+    for ph in manifest.photos.values():
+        if product and ph.product != product:
+            continue
+        by_product.setdefault(ph.product, []).append(ph)
+
+    out: dict[str, list[str]] = {}
+    for prod, photos in by_product.items():
+        photos = sorted(photos, key=lambda p: Path(p.input_path).name.lower())
+        dest_dir = _final_dir(st, manifest.output_root, prod)
+        shot = 0
+        written: list[str] = []
+        for ph in photos:
+            task = "worn" if (ph.classification or "packshot") == "worn" else "packshot"
+            for v in ph.final_kept():
+                shot += 10
+                graded = ph.display_for(v)            # graded output path
+                if not st.exists(graded):
+                    continue
+                ext = (Path(graded).suffix or ".png").lower()
+                base = f"{slug}_SH{shot:04d}_{task}"
+                ver = _next_version(st, dest_dir, base, ext)
+                name = f"{base}_v{ver:03d}{ext}"
+                dest = st.join(dest_dir, name)
+                st.write_bytes(dest, st.read_bytes(graded))
+                written.append(dest)
+        if written:
+            out[prod] = written
+            with _MANIFEST_LOCK:
+                log = manifest.delivered.setdefault(prod, [])
+                log.extend({"path": p, "ts": ts} for p in written)
+    _persist(cfg, manifest)
+    return out
 
 
 def hide_variant(cfg: Config, manifest: M.Manifest,
@@ -919,38 +995,6 @@ def purge_hidden(cfg: Config, manifest: M.Manifest) -> int:
         with _MANIFEST_LOCK:
             photo.hidden_variants = []
     _persist(cfg, manifest)
-    return n
-
-
-def submit_grade(
-    cfg: Config,
-    manifest: M.Manifest,
-    photo: M.PhotoState,
-    variant_path: str,
-) -> Future:
-    """Kick off grading in the background. Returns a Future the UI polls.
-    Heavy (PIL + LAB transfer + disk I/O) — running it on the UI thread freezes Streamlit
-    for ~5–15s per pick, which is the worst part of the experience to keep blocking."""
-    def _task():
-        try:
-            select_variant(cfg, manifest, photo, variant_path)
-        except Exception as e:
-            with _MANIFEST_LOCK:
-                photo.last_error = f"Grading failed: {e}"
-            _persist(cfg, manifest)
-            raise
-
-    return _get_grade_executor().submit(_task)
-
-
-def regrade_all_selected(cfg: Config, manifest: M.Manifest) -> int:
-    """Re-grade every photo that has a selected variant, using the current manifest.hero_path.
-    Returns count of re-graded photos. Local-only — no API calls, no cost."""
-    n = 0
-    for photo in manifest.photos.values():
-        if photo.selected_variant and Path(photo.selected_variant).exists():
-            select_variant(cfg, manifest, photo, photo.selected_variant)
-            n += 1
     return n
 
 

@@ -32,6 +32,12 @@ class PhotoState:
     # for migrating older single-select manifests (see Manifest.from_json).
     hidden_variants: list[str] = field(default_factory=list)
     graded_variants: dict = field(default_factory=dict)       # variant_path → graded output path
+    # Delivery (Stage 3): variant paths the art director starred as finals. Only
+    # these are exported to the clean 03_Final folder with deliverable names.
+    final_variants: list[str] = field(default_factory=list)
+    # `selected_variant`/`graded` are LEGACY single-select fields, kept only so old
+    # manifests still load + migrate (see Manifest.from_json). New code never writes
+    # them — use `has_graded` / `graded_variants` instead.
     selected_variant: Optional[str] = None
     graded: bool = False
     cost_usd: float = 0.0
@@ -61,8 +67,24 @@ class PhotoState:
         hidden = set(self.hidden_variants or [])
         return [v for v in (self.variants or []) if v not in hidden]
 
+    @property
+    def has_graded(self) -> bool:
+        """True if any kept variant has a graded output. The single source of truth
+        for 'this photo has been graded' (replaces the legacy `graded` bool)."""
+        kept = set(self.kept_variants)
+        return any(v in kept for v in (self.graded_variants or {}))
+
     def is_graded(self, variant_path: str) -> bool:
         return variant_path in (self.graded_variants or {})
+
+    def is_final(self, variant_path: str) -> bool:
+        return variant_path in (self.final_variants or [])
+
+    def final_kept(self) -> list[str]:
+        """Starred finals that are still kept AND graded — what delivery exports."""
+        kept = set(self.kept_variants)
+        return [v for v in (self.final_variants or [])
+                if v in kept and v in (self.graded_variants or {})]
 
     def display_for(self, variant_path: str) -> str:
         """The image to show for a kept variant: its graded output if it has one,
@@ -90,9 +112,12 @@ class Manifest:
     # reused as the default when grading other variants of the same product so the
     # art director tunes once and re-applies quickly across the set.
     product_grade_params: dict = field(default_factory=dict)
-    # Two-stage workflow: folder → "select" (curate generations) | "grade" (harmonize
-    # to a hero). Default "select"; flips per product when the AD moves to grading.
+    # Workflow stage: folder → "select" (curate generations) | "grade" (converge to a
+    # reference) | "deliver" (pick finals + export). Default "select".
     product_stage: dict = field(default_factory=dict)
+    # Delivery log: folder → list of {"path": <03_Final path>, "ts": <iso>}. Lets the
+    # board show "delivered N on <date>" and lets re-export bump the version suffix.
+    delivered: dict = field(default_factory=dict)
     # Cached folder discovery: [[product, image_path], ...]. Populated by ingest so a
     # re-open doesn't re-list every product folder on the backend (slow on Dropbox).
     # Refreshed only when the user invokes "Rescan folder".
@@ -113,6 +138,7 @@ class Manifest:
                 "product_heroes": self.product_heroes,
                 "product_grade_params": self.product_grade_params,
                 "product_stage": self.product_stage,
+                "delivered": self.delivered,
                 "discovered": self.discovered,
             },
             indent=2,
@@ -141,6 +167,7 @@ class Manifest:
             product_heroes=dict(obj.get("product_heroes", {})),
             product_grade_params=dict(obj.get("product_grade_params", {})),
             product_stage=dict(obj.get("product_stage", {})),
+            delivered=dict(obj.get("delivered", {})),
             discovered=list(obj.get("discovered", [])),
         )
 
