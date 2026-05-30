@@ -1813,6 +1813,16 @@ def render_sidebar():
                     n = _build_all_thumbs(manifest)
                 st.toast(f"Built {n} thumbnail(s).", icon="⚡")
                 st.rerun()
+            n_hidden = sum(len(p.hidden_variants or []) for p in manifest.photos.values())
+            if n_hidden:
+                if st.button(f"🗑 Empty trash ({n_hidden})", use_container_width=True,
+                             key="empty_trash",
+                             help="Permanently delete the variants you've removed "
+                                  "(and their graded outputs). Cannot be undone."):
+                    with st.spinner("Deleting…"):
+                        n = P.purge_hidden(cfg, manifest)
+                    st.toast(f"Permanently deleted {n} variant(s).", icon="🗑")
+                    st.rerun()
 
         # Keys + model
         st.markdown("---")
@@ -2422,6 +2432,78 @@ def render_board_card(photo: M.PhotoState):
     )
 
 
+# ── Gallery tile (one per kept variant) + its callbacks ──────────────────
+
+def _cb_open_detail_variant(pid: str) -> None:
+    st.session_state["detail_photo_id"] = pid
+    st.session_state["route"] = "detail"
+
+
+def _cb_hide_variant(pid: str, vpath: str) -> None:
+    mf = st.session_state.get("manifest")
+    if mf and pid in mf.photos:
+        P.hide_variant(cfg, mf, mf.photos[pid], vpath)
+        st.session_state["__last_hidden"] = (pid, vpath)
+        st.toast("Variant deleted — Undo at the top.", icon="🗑")
+
+
+def _cb_grade_variant(pid: str, vpath: str) -> None:
+    mf = st.session_state.get("manifest")
+    if not mf or pid not in mf.photos:
+        return
+    pend = st.session_state.setdefault("pending_grades", {})
+    gkey = f"{pid}::{Path(vpath).name}"
+    ex = pend.get(gkey)
+    if ex is not None and not ex.done():
+        return
+    pend[gkey] = P.submit_grade_variant(cfg, mf, mf.photos[pid], vpath)
+
+
+def render_gallery_tile(photo: M.PhotoState, variant_path: str) -> None:
+    """One gallery tile = one kept variant. Shows the graded output if the variant
+    has been graded, else the raw variant. Hover-light controls: open detail, grade,
+    delete. (Phase D will refine the affordances/icons.)"""
+    disp = photo.display_for(variant_path)
+    is_graded = photo.is_graded(variant_path)
+    vname = Path(variant_path).name
+    vkey = f"{photo.photo_id}::{vname}"
+
+    gkey = f"{photo.photo_id}::{vname}"
+    gfut = st.session_state.get("pending_grades", {}).get(gkey)
+    is_grading = gfut is not None and not gfut.done()
+
+    with st.container(key=f"boardimg-{vkey}"):
+        st.image(_board_thumb(disp), use_container_width=True)
+
+    with st.container(key=f"boardctrls-{vkey}"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.button("⤢", key=f"open::{vkey}", use_container_width=True,
+                      help="Open detail view",
+                      on_click=_cb_open_detail_variant, args=(photo.photo_id,))
+        with c2:
+            if is_grading:
+                st.button("…", key=f"grd::{vkey}", use_container_width=True,
+                          disabled=True, help="Grading…")
+            elif is_graded:
+                st.button("✓", key=f"grd::{vkey}", use_container_width=True,
+                          help="Graded — click to re-grade against the current hero",
+                          on_click=_cb_grade_variant, args=(photo.photo_id, variant_path))
+            else:
+                st.button("◧", key=f"grd::{vkey}", use_container_width=True,
+                          disabled=not cfg.anthropic_api_key and False,  # grading is local
+                          help="Grade — colour-match to the hero",
+                          on_click=_cb_grade_variant, args=(photo.photo_id, variant_path))
+        with c3:
+            st.button("✕", key=f"del::{vkey}", use_container_width=True,
+                      help="Delete this variant (reversible — Undo at the top)",
+                      on_click=_cb_hide_variant, args=(photo.photo_id, variant_path))
+
+    badge = ("<span class='badge badge-ready'>✓ graded</span>" if is_graded
+             else f"<span class='subtle' style='font-size:11px;'>{vname}</span>")
+    st.markdown(f"<div style='margin-top:2px;'>{badge}</div>", unsafe_allow_html=True)
+
+
 def render_board_page():
     project: PROJ.Project | None = st.session_state.get("project")
     manifest: M.Manifest | None = st.session_state.get("manifest")
@@ -2451,8 +2533,8 @@ def render_board_page():
 
     # ── Header: project + key stats + primary action
     n_total = len(manifest.photos)
-    n_ready = sum(1 for p in manifest.photos.values() if p.variants)
-    n_graded = sum(1 for p in manifest.photos.values() if p.graded)
+    n_visuals = sum(len(p.kept_variants) for p in manifest.photos.values())
+    n_graded = sum(len(p.graded_variants or {}) for p in manifest.photos.values())
     pending_count = sum(1 for p in manifest.photos.values() if not p.variants)
 
     h1, h2 = st.columns([5, 2])
@@ -2460,9 +2542,9 @@ def render_board_page():
         st.markdown(
             f"<div style='font-size:22px;font-weight:600;letter-spacing:-0.01em;'>{project.name}</div>"
             f"<div class='row-wrap' style='margin-top:6px;font-size:12px;color:var(--text-3);'>"
-            f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>{n_total}</b> photos</span>"
+            f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>{n_total}</b> renders</span>"
             f"<span style='color:var(--text-disabled);margin:0 2px;'>·</span>"
-            f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>{n_ready}</b> with variants</span>"
+            f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>{n_visuals}</b> visuals</span>"
             f"<span style='color:var(--text-disabled);margin:0 2px;'>·</span>"
             f"<span><b style='color:var(--text);font-variant-numeric:tabular-nums;'>{n_graded}</b> graded</span>"
             f"<span style='color:var(--text-disabled);margin:0 2px;'>·</span>"
@@ -2595,30 +2677,35 @@ def render_board_page():
     card_size = st.session_state.get("board_card_size", "Medium")
     cols_per_row = _board_cols_for_size(card_size)
 
-    # Warm persisted thumbnails (≈30 KB each) for every card's display image in one
-    # parallel batch — instead of downloading + decoding full-res 2K images. This is
-    # the main lever that turns project open from minutes into seconds on Dropbox.
+    # ── Gallery: one tile per KEPT variant, grouped by product. The scroll now
+    # reflects the generated/graded visuals (not one card per input render).
+    # Undo for the last soft-deleted variant.
+    last_hidden = st.session_state.get("__last_hidden")
+    if last_hidden:
+        uc1, uc2 = st.columns([4, 1])
+        with uc2:
+            if st.button("↶ Undo delete", key="undo_hide", use_container_width=True):
+                pid, vpath = last_hidden
+                if pid in manifest.photos:
+                    P.unhide_variant(cfg, manifest, manifest.photos[pid], vpath)
+                st.session_state.pop("__last_hidden", None)
+                st.rerun()
+
+    # Warm persisted thumbnails (≈30 KB each) for every kept visual in one parallel
+    # batch — the main lever that turns project open from minutes into seconds.
     _prefetch_thumbs([
-        photo.output_path if photo.graded
-        else (photo.variants[_current_board_variant(photo)] if photo.variants
-              else photo.input_path)
-        for photo in manifest.photos.values()
+        ph.display_for(v) for ph in manifest.photos.values() for v in ph.kept_variants
     ])
 
     for product_name in ordered_keys:
-        photos = products[product_name]
-        # Stable sort by filename within the product
-        photos = sorted(photos, key=lambda p: Path(p.input_path).name.lower())
+        photos = sorted(products[product_name], key=lambda p: Path(p.input_path).name.lower())
         pg = project.find_product(product_name) if project else None
         is_worn = (pg.is_worn if pg else (photos[0].classification == "worn" if photos else False))
-        n_total_p = len(photos)
-        n_ready_p = sum(1 for p in photos if p.variants)
-        n_graded_p = sum(1 for p in photos if p.graded)
+        tiles = [(ph, v) for ph in photos for v in ph.kept_variants]
+        n_graded_p = sum(1 for ph, v in tiles if ph.is_graded(v))
+        n_pending_p = sum(1 for ph in photos if not ph.variants)
 
         cls_class = "badge-worn" if is_worn else "badge-packshot"
-        # Per-product hero override flag (small indicator → product uses its own hero, not project default)
-        # Trust the manifest dict — membership means a hero was written for this
-        # product. Avoids a network existence probe per product on every rerun.
         has_override = bool(manifest.product_heroes.get(product_name))
         hero_badge = (
             "<span class='badge' style='background:var(--accent-muted);color:var(--accent);"
@@ -2627,7 +2714,7 @@ def render_board_page():
             "★ own hero</span>"
             if has_override else ""
         )
-        # One coherent header with the badge + readable stats + description
+        pend_txt = f" · {n_pending_p} pending" if n_pending_p else ""
         st.markdown(
             f"<div style='margin-top:32px;margin-bottom:10px;'>"
             f"<div class='row-wrap' style='margin-bottom:4px;'>"
@@ -2635,7 +2722,7 @@ def render_board_page():
             f"<span class='badge {cls_class}'>{'worn' if is_worn else 'packshot'}</span>"
             f"{hero_badge}"
             f"<span class='subtle' style='font-size:12px;font-variant-numeric:tabular-nums;'>"
-            f"{n_graded_p} graded · {n_ready_p}/{n_total_p} prepared"
+            f"{len(tiles)} visuals · {n_graded_p} graded{pend_txt}"
             f"</span>"
             f"</div>"
             + (f"<div class='subtle' style='font-size:13px;font-style:italic;'>"
@@ -2644,15 +2731,18 @@ def render_board_page():
             unsafe_allow_html=True,
         )
 
-        # Always allocate a full row of slots so card widths stay consistent
-        # across rows; trailing empties stay invisible (cleaner than st.empty(),
-        # which reserves the slot but yields a forlorn narrow card on partial rows).
-        for row_start in range(0, len(photos), cols_per_row):
-            row_photos = photos[row_start:row_start + cols_per_row]
+        if not tiles:
+            st.markdown(
+                "<div class='subtle' style='font-size:13px;padding:8px 0;'>"
+                "No visuals yet — use <b>Auto-prepare</b> above to generate.</div>",
+                unsafe_allow_html=True,
+            )
+        for row_start in range(0, len(tiles), cols_per_row):
+            row = tiles[row_start:row_start + cols_per_row]
             cols = st.columns(cols_per_row, gap="small")
-            for i, photo in enumerate(row_photos):
+            for i, (ph, v) in enumerate(row):
                 with cols[i]:
-                    render_board_card(photo)
+                    render_gallery_tile(ph, v)
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
     # ── Autorefresh while any background work is running (regen, prompt, grade)
@@ -2699,19 +2789,21 @@ def _render_product_hero_controls(manifest: M.Manifest, photo: M.PhotoState) -> 
         if effective and _exists_cached(effective):
             st.image(_board_thumb(effective, max_edge=180), width=180)
 
+        # Most-recent graded output for this photo (if any) → can become the hero.
+        graded_out = next(reversed(list(photo.graded_variants.values())), None) if photo.graded_variants else None
         c1, c2 = st.columns(2)
         with c1:
             if st.button(
-                f"📌 Use this output as hero for this product",
+                f"📌 Use a graded output as hero for this product",
                 key=f"prodhero_{photo.photo_id}",
                 use_container_width=True,
-                disabled=not photo.graded,
-                help="Grade & save a variant first" if not photo.graded
-                     else "Set this product's grading reference to the saved output",
+                disabled=not graded_out,
+                help="Grade a variant first" if not graded_out
+                     else "Set this product's grading reference to a graded output",
             ):
-                name = ST.name(photo.output_path)
+                name = ST.name(graded_out)
                 tgt = ST.join(manifest.output_root, ".hero", "products", product, name)
-                ST.write_bytes(tgt, ST.read_bytes(photo.output_path))
+                ST.write_bytes(tgt, ST.read_bytes(graded_out))
                 manifest.product_heroes[product] = tgt
                 M.save(manifest, ST)
                 st.success(f"Product hero set: {name}")
@@ -2754,12 +2846,13 @@ def _render_worn_product_ref_controls(manifest: M.Manifest, photo: M.PhotoState)
     next regenerate (see pipeline.generate_variants_for). Falls back to the static
     product-ref files when nothing is picked.
     """
-    # Candidate generated packshots: graded outputs of packshot-classified photos.
-    candidates = [
-        p for p in manifest.photos.values()
-        if (p.classification or "packshot") == "packshot" and p.graded
-    ]
-    candidates.sort(key=lambda p: p.photo_id)
+    # Candidate generated packshots: each GRADED output of a packshot-classified photo.
+    candidates: list[tuple[M.PhotoState, str]] = []
+    for p in manifest.photos.values():
+        if (p.classification or "packshot") == "packshot":
+            for gpath in (p.graded_variants or {}).values():
+                candidates.append((p, gpath))
+    candidates.sort(key=lambda t: (t[0].photo_id, t[1]))
 
     with st.expander("🧩 Product reference (generated packshot)", expanded=False):
         st.caption(
@@ -2771,20 +2864,18 @@ def _render_worn_product_ref_controls(manifest: M.Manifest, photo: M.PhotoState)
             st.info("No graded packshots yet — grade a packshot photo, then pick it here.")
             return
 
-        def _cand_label(p: M.PhotoState) -> str:
-            # Lead with the product description (per-product brief set at project
-            # creation) so the user picks by what the product IS, not by an opaque
-            # timestamp filename. Keep the folder + filename as a disambiguator,
-            # since several graded packshots can share one description.
+        def _cand_label(p: M.PhotoState, gpath: str) -> str:
+            # Lead with the product description so the user picks by what the product
+            # IS, not by an opaque timestamp filename.
             desc = (manifest.product_briefs.get(p.product) or "").strip()
-            name = ST.name(p.input_path)
+            name = ST.name(gpath)
             if desc:
                 short = desc if len(desc) <= 70 else desc[:69].rstrip() + "…"
                 return f"{short}  ·  {p.product}/{name}"
             return f"{p.product}/{name}"
 
-        labels = ["— none (use static product refs) —"] + [_cand_label(p) for p in candidates]
-        paths = [None] + [p.output_path for p in candidates]
+        labels = ["— none (use static product refs) —"] + [_cand_label(p, g) for p, g in candidates]
+        paths = [None] + [g for _p, g in candidates]
         try:
             cur_idx = paths.index(photo.product_ref_path) if photo.product_ref_path in paths else 0
         except ValueError:
@@ -2941,11 +3032,11 @@ def render_photo_card(photo: M.PhotoState):
     stem = Path(photo.input_path).stem
 
     # Warm this photo's images in parallel so the detail view's first paint doesn't
-    # download input + output + every variant one-by-one on the Dropbox backend.
+    # download input + variants + graded outputs one-by-one on the Dropbox backend.
     _prefetch_materialize(
         [photo.input_path]
-        + ([photo.output_path] if photo.graded else [])
-        + list(photo.variants)
+        + list(photo.kept_variants)
+        + list((photo.graded_variants or {}).values())
     )
 
     view_mode = st.session_state.get("detail_view_mode", "Side by side")
@@ -3053,92 +3144,45 @@ def render_photo_card(photo: M.PhotoState):
                       fs_caption=f"Input · {Path(photo.input_path).name}")
                 _save_button(manifest, photo, photo.input_path, "input", f"save_input_{photo.photo_id}")
             with variants_col:
-                if photo.variants:
-                    st.caption(f"**Variants ({len(photo.variants)})** — click **Pick** to grade + save")
-                    n_cols = min(len(photo.variants), 4)
+                kept = photo.kept_variants
+                if kept:
+                    st.caption(
+                        f"**Variants ({len(kept)})** — all kept by default. "
+                        f"Grade the keepers, ✕ the weak ones, click a thumbnail to zoom."
+                    )
+                    n_cols = min(len(kept), 4)
                     grid = st.columns(n_cols)
-                    # Full-size lightbox flips across all variants with ← →.
-                    variant_group = [
-                        (vp, f"Variant v{j + 1} · {Path(vp).name}")
-                        for j, vp in enumerate(photo.variants)
-                    ]
-                    for i, vp in enumerate(photo.variants):
+                    variant_group = [(photo.display_for(vp), f"{Path(vp).name}") for vp in kept]
+                    for i, vp in enumerate(kept):
                         with grid[i % n_cols]:
-                            is_selected = vp == photo.selected_variant
-                            cap = f"v{i + 1} ✓" if is_selected else f"v{i + 1}"
-                            thumb(vp, width=thumb_variant, caption=cap,
+                            graded = photo.is_graded(vp)
+                            gkey = f"{photo.photo_id}::{Path(vp).name}"
+                            gf = st.session_state.get("pending_grades", {}).get(gkey)
+                            v_grading = gf is not None and not gf.done()
+                            thumb(photo.display_for(vp), width=thumb_variant,
+                                  caption=(f"v{i + 1} ✓" if graded else f"v{i + 1}"),
                                   fs_key=f"fs_var_{photo.photo_id}_{i}",
-                                  fs_caption=f"Variant v{i + 1} · {Path(vp).name}",
+                                  fs_caption=f"v{i + 1} · {Path(vp).name}",
                                   fs_group=variant_group, fs_index=i)
-                            if st.button("🆚 Compare", key=f"cmp_{photo.photo_id}_{i}",
-                                         use_container_width=True,
-                                         help="Slide between input render and this variant"):
-                                _show_comparison(
-                                    before_path=photo.input_path,
-                                    after_path=vp,
-                                    before_label="Input (3D render)",
-                                    after_label=f"Variant v{i + 1}",
-                                    title=f"v{i + 1} · {Path(vp).name}",
+                            gc, dc = st.columns([3, 1])
+                            with gc:
+                                st.button(
+                                    "✓ Graded" if graded else ("● Grading…" if v_grading else "Grade"),
+                                    key=f"grade_{photo.photo_id}_{i}", use_container_width=True,
+                                    disabled=v_grading,
+                                    help="Colour-match this variant to the hero (re-grades if already graded)",
+                                    on_click=_cb_grade_variant, args=(photo.photo_id, vp),
                                 )
-                            if is_grading:
-                                label = "● Grading…"
-                            elif is_selected:
-                                label = "✓ Picked"
-                            else:
-                                label = "Pick"
-                            if st.button(label, key=f"pick_{photo.photo_id}_{i}",
-                                         disabled=is_selected or is_grading,
-                                         use_container_width=True):
-                                _handle_select(photo, vp)
-                            _save_button(manifest, photo, vp, f"variant-v{i + 1}",
-                                         f"save_var_{photo.photo_id}_{i}")
+                            with dc:
+                                st.button(
+                                    "✕", key=f"del_{photo.photo_id}_{i}", use_container_width=True,
+                                    help="Delete this variant (reversible — Undo on the board)",
+                                    on_click=_cb_hide_variant, args=(photo.photo_id, vp),
+                                )
+                elif photo.variants:
+                    st.caption("_(all variants deleted — Undo on the board, or Regenerate)_")
                 else:
                     st.caption("_(no variants yet — click Regenerate)_")
-
-            if (
-                view_mode == "Side by side"
-                and photo.selected_variant
-                and photo.graded
-            ):
-                st.markdown("##### Grading: variant → harmonizer output")
-                g1, g2 = st.columns(2)
-                with g1:
-                    thumb(photo.selected_variant, width=thumb_compare,
-                          caption="Selected variant (raw from Nano Banana)",
-                          fs_key=f"fs_sel_{photo.photo_id}",
-                          fs_caption=f"Selected variant · {Path(photo.selected_variant).name}")
-                    _save_button(manifest, photo, photo.selected_variant, "variant-selected",
-                                 f"save_sel_{photo.photo_id}")
-                with g2:
-                    thumb(photo.output_path, width=thumb_compare,
-                          caption="Graded (saved to output folder)",
-                          fs_key=f"fs_graded_{photo.photo_id}",
-                          fs_caption=f"Graded output · {Path(photo.output_path).name}")
-                    _save_button(manifest, photo, photo.output_path, "graded",
-                                 f"save_graded_{photo.photo_id}")
-                    if st.button("🆚 Slide: raw → graded", key=f"cmp_grading_{photo.photo_id}",
-                                 use_container_width=True):
-                        _show_comparison(
-                            before_path=photo.selected_variant,
-                            after_path=photo.output_path,
-                            before_label="Raw variant",
-                            after_label="Graded",
-                            title=f"Grading effect on {Path(photo.output_path).name}",
-                        )
-                    is_current_hero = manifest.hero_photo_id == photo.photo_id
-                    if st.button(
-                        "📌 Currently the hero" if is_current_hero else "📌 Use as hero",
-                        key=f"sethero_{photo.photo_id}",
-                        disabled=is_current_hero, use_container_width=True,
-                    ):
-                        out_name = ST.name(photo.output_path)
-                        hero_target = ST.join(manifest.output_root, ".hero", out_name)
-                        ST.write_bytes(hero_target, ST.read_bytes(photo.output_path))
-                        manifest.hero_path = hero_target
-                        manifest.hero_photo_id = photo.photo_id
-                        M.save(manifest, ST)
-                        st.success(f"Hero set to {out_name}")
-                        st.rerun()
 
         # Prompt
         st.markdown("##### Prompt sent to Nano Banana")
