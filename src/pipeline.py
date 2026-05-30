@@ -452,8 +452,11 @@ def generate_prompt_for(
     manifest: M.Manifest,
     photo: M.PhotoState,
     anthropic_client: AnthropicClient,
+    force: bool = False,
 ) -> None:
-    if photo.prompt:
+    # `force` re-runs even when a prompt already exists, WITHOUT first blanking it —
+    # the new prompt overwrites the old atomically, so the editor never flashes empty.
+    if photo.prompt and not force:
         return
     st = get_storage(cfg)
     if photo.classification is None:
@@ -626,20 +629,20 @@ def submit_generate_prompt(
     """
     Kick off Claude classify + prompt generation in the prompt executor.
     Returns a Future so the UI can poll completion without blocking.
-    `force=True` (default) wipes photo.prompt first so generate_prompt_for actually re-runs.
-    For worn shots it also clears the cached analyzer template, so "(Re)generate prompt"
-    means a genuinely fresh analysis (not just re-assembling the same template).
+    `force=True` (default) re-runs generation even if a prompt already exists. The old
+    prompt is NOT blanked first — generate_prompt_for(force=True) overwrites it atomically
+    when the new one is ready, so the editor never flashes empty (and a failed call leaves
+    the previous prompt intact). For worn shots, force clears only the cached analyzer
+    template so "(Re)generate prompt" does a genuinely fresh analysis.
     """
     def _task():
         try:
             if photo.classification is None:
                 classify_photo(cfg, manifest, photo, anthropic_client)
-            if force:
+            if force and (photo.classification or "packshot") == "worn":
                 with _MANIFEST_LOCK:
-                    photo.prompt = None
-                    if (photo.classification or "packshot") == "worn":
-                        photo.worn_template = None
-            generate_prompt_for(cfg, manifest, photo, anthropic_client)
+                    photo.worn_template = None
+            generate_prompt_for(cfg, manifest, photo, anthropic_client, force=force)
         except Exception as e:
             with _MANIFEST_LOCK:
                 photo.last_error = str(e)
