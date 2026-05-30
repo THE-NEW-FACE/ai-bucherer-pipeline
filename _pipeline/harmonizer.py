@@ -91,6 +91,34 @@ def hex_to_lab(h: str) -> np.ndarray:
 
 # ═══ Subject / background masking ════════════════════════════════════════
 
+def _background_components(candidate: np.ndarray, min_area_frac: float = 0.004) -> np.ndarray:
+    """From a binary 'looks like backdrop' mask, keep only true background regions:
+    components that TOUCH THE BORDER (open seamless backdrop) OR are large enough to be
+    enclosed backdrop (e.g. the hole inside a hoop). This drops small interior bright
+    specks — gold speculars and near-white highlights — that share the backdrop's
+    brightness/low-chroma but are surrounded by jewellery, which is exactly what was
+    getting wrongly whitened. Degrades to a no-op if scipy is unavailable."""
+    try:
+        from scipy import ndimage
+    except Exception:
+        return candidate
+    lbl, n = ndimage.label(candidate)
+    if n == 0:
+        return candidate
+    h, w = candidate.shape
+    min_area = max(64, int(min_area_frac * h * w))
+    border = np.unique(np.concatenate([lbl[0, :], lbl[-1, :], lbl[:, 0], lbl[:, -1]]))
+    keep = set(int(i) for i in border if i != 0)
+    sizes = ndimage.sum(np.ones_like(candidate, dtype=np.float32), lbl,
+                        index=np.arange(1, n + 1))
+    for i in range(1, n + 1):
+        if sizes[i - 1] >= min_area:
+            keep.add(i)
+    if not keep:
+        return np.zeros_like(candidate)
+    return np.isin(lbl, list(keep))
+
+
 def detect_background_mask(
     lab: np.ndarray,
     l_threshold: float = 88.0,
@@ -99,16 +127,20 @@ def detect_background_mask(
     blur_radius: float = 2.0,
 ) -> np.ndarray:
     """
-    Background mask = (L is bright enough) AND (chroma is below threshold).
-    Chroma is a HARD gate (binary), L uses a soft ramp. Then Gaussian-blur for clean edges.
-    The hard chroma gate is critical: a gradient gate would let warm/cool background tints
-    leak through the soft mask into the output via blending, causing per-image color drift.
+    Background mask = (L is bright enough) AND (chroma is below threshold), then RESTRICTED
+    to border-connected / large regions so interior gold speculars don't leak in.
+    Chroma is a HARD gate (binary), L uses a soft ramp; the spatial restriction is what
+    keeps bright jewellery highlights out of the background. Gaussian-blur for clean edges.
     """
     L = lab[..., 0]
     chroma = np.sqrt(lab[..., 1] ** 2 + lab[..., 2] ** 2)
     l_score = np.clip((L - l_threshold) / ramp, 0.0, 1.0)
     chroma_gate = (chroma < chroma_threshold).astype(np.float64)
-    mask = l_score * chroma_gate
+    # Spatially confine the candidate to the actual backdrop (border-connected or large
+    # enclosed), so a gold highlight that happens to be bright + low-chroma is excluded.
+    candidate = (l_score > 0.0) & (chroma_gate > 0.5)
+    candidate = _background_components(candidate)
+    mask = l_score * chroma_gate * candidate.astype(np.float64)
     if blur_radius > 0:
         mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
         mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
