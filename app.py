@@ -106,7 +106,9 @@ st.markdown(
     .block-container {
       padding-top: var(--s-5) !important;
       padding-bottom: var(--s-7) !important;
-      max-width: 1440px !important;
+      padding-left: 2.5rem !important;
+      padding-right: 2.5rem !important;
+      max-width: 100% !important;   /* use the full width — the gallery is the focus */
     }
 
     /* ── Streamlit chrome cleanup ── */
@@ -2504,6 +2506,51 @@ def render_gallery_tile(photo: M.PhotoState, variant_path: str) -> None:
     st.markdown(f"<div style='margin-top:2px;'>{badge}</div>", unsafe_allow_html=True)
 
 
+def render_input_tile(photo: M.PhotoState) -> None:
+    """The pinned 3D-render reference at the far left of a carousel row."""
+    with st.container(key=f"boardimg-input-{photo.photo_id}"):
+        st.image(_board_thumb(photo.input_path), use_container_width=True)
+    st.button("⤢ 3D render", key=f"openinput::{photo.photo_id}", use_container_width=True,
+              help="Open this render's detail view",
+              on_click=_cb_open_detail_variant, args=(photo.photo_id,))
+
+
+def _cb_carousel(pid: str, delta: int, n_slots: int, n_total: int) -> None:
+    key = f"carousel::{pid}"
+    cur = st.session_state.get(key, 0)
+    max_off = max(0, n_total - n_slots)
+    st.session_state[key] = min(max(cur + delta, 0), max_off)
+
+
+def render_carousel_row(photo: M.PhotoState, cols_per_row: int) -> None:
+    """One render's row: [‹] [input 3D render] [variant tiles…] [›]. The variants are
+    a horizontal carousel — arrows page through them when there are more than fit."""
+    variants = photo.kept_variants
+    n_slots = max(1, cols_per_row - 1)            # variant slots beside the pinned input
+    off_key = f"carousel::{photo.photo_id}"
+    off = min(max(st.session_state.get(off_key, 0), 0), max(0, len(variants) - n_slots))
+    window = variants[off:off + n_slots]
+    can_prev, can_next = off > 0, off < max(0, len(variants) - n_slots)
+
+    cols = st.columns([0.3] + [1] * (1 + n_slots) + [0.3],
+                      gap="small", vertical_alignment="center")
+    with cols[0]:
+        if can_prev:
+            st.button("‹", key=f"cprev::{photo.photo_id}", use_container_width=True,
+                      help="Previous variants",
+                      on_click=_cb_carousel, args=(photo.photo_id, -1, n_slots, len(variants)))
+    with cols[1]:
+        render_input_tile(photo)
+    for j, v in enumerate(window):
+        with cols[2 + j]:
+            render_gallery_tile(photo, v)
+    with cols[-1]:
+        if can_next:
+            st.button("›", key=f"cnext::{photo.photo_id}", use_container_width=True,
+                      help="More variants",
+                      on_click=_cb_carousel, args=(photo.photo_id, 1, n_slots, len(variants)))
+
+
 def render_board_page():
     project: PROJ.Project | None = st.session_state.get("project")
     manifest: M.Manifest | None = st.session_state.get("manifest")
@@ -2691,11 +2738,12 @@ def render_board_page():
                 st.session_state.pop("__last_hidden", None)
                 st.rerun()
 
-    # Warm persisted thumbnails (≈30 KB each) for every kept visual in one parallel
-    # batch — the main lever that turns project open from minutes into seconds.
-    _prefetch_thumbs([
-        ph.display_for(v) for ph in manifest.photos.values() for v in ph.kept_variants
-    ])
+    # Warm persisted thumbnails (≈30 KB each) for every kept visual AND the pinned
+    # input renders in one parallel batch — the main lever that makes open fast.
+    _prefetch_thumbs(
+        [ph.input_path for ph in manifest.photos.values() if ph.kept_variants]
+        + [ph.display_for(v) for ph in manifest.photos.values() for v in ph.kept_variants]
+    )
 
     for product_name in ordered_keys:
         photos = sorted(products[product_name], key=lambda p: Path(p.input_path).name.lower())
@@ -2731,18 +2779,18 @@ def render_board_page():
             unsafe_allow_html=True,
         )
 
-        if not tiles:
+        # One carousel row per render that has kept variants: the input 3D render is
+        # pinned on the far left, then that render's variants, with ‹ › arrows on
+        # each side to page through them.
+        rows = [ph for ph in photos if ph.kept_variants]
+        if not rows:
             st.markdown(
                 "<div class='subtle' style='font-size:13px;padding:8px 0;'>"
                 "No visuals yet — use <b>Auto-prepare</b> above to generate.</div>",
                 unsafe_allow_html=True,
             )
-        for row_start in range(0, len(tiles), cols_per_row):
-            row = tiles[row_start:row_start + cols_per_row]
-            cols = st.columns(cols_per_row, gap="small")
-            for i, (ph, v) in enumerate(row):
-                with cols[i]:
-                    render_gallery_tile(ph, v)
+        for ph in rows:
+            render_carousel_row(ph, cols_per_row)
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
     # ── Autorefresh while any background work is running (regen, prompt, grade)
