@@ -3427,17 +3427,28 @@ def render_photo_card(photo: M.PhotoState):
                           disabled=len(kept) < 2, help="Next option (→)",
                           on_click=_cb_detail_opt, args=(photo.photo_id, 1, len(kept)))
 
-            # Image LEFT, grade controls RIGHT — so the AD tunes and previews together.
-            params = _current_grade_params(manifest, photo)
-            img_col, grade_col = st.columns([2, 1.25], gap="large")
+            # Grade controls (right column) only in Stage 2. In Stage 1 (Select) the
+            # image takes the full width — tidier, generation-focused.
+            grading_stage = manifest.product_stage.get(photo.product, "select") == "grade"
+            params = (_current_grade_params(manifest, photo) if grading_stage
+                      else {"strength": 0, "whiten": True, "warmth": 0, "gold": 0, "cool": 0})
+            if grading_stage:
+                img_col, grade_col = st.columns([2, 1.25], gap="large")
+            else:
+                img_col, grade_col = st.container(), st.container()
 
             with img_col:
-                vc1, vc2 = st.columns(2)
-                with vc1:
-                    preview = st.checkbox("👁 Preview grade", key=f"prev_toggle_{photo.photo_id}",
-                                          help="Show the current grade live on this image "
-                                               "(not saved — use Apply to save the graded version)")
-                with vc2:
+                if grading_stage:
+                    vc1, vc2 = st.columns(2)
+                    with vc1:
+                        preview = st.checkbox("👁 Preview grade", key=f"prev_toggle_{photo.photo_id}",
+                                              help="Show the current grade live on this image "
+                                                   "(not saved — use Apply to save the graded version)")
+                    with vc2:
+                        compare = st.toggle("Compare with 3D render", key=f"cmp_toggle_{photo.photo_id}",
+                                            help="Slide between the input render and this option")
+                else:
+                    preview = False
                     compare = st.toggle("Compare with 3D render", key=f"cmp_toggle_{photo.photo_id}",
                                         help="Slide between the input render and this option")
                 # Live-graded bytes when Preview is on (reused by both the plain view
@@ -3488,7 +3499,8 @@ def render_photo_card(photo: M.PhotoState):
                               on_click=_cb_hide_variant, args=(photo.photo_id, vp))
                 _inject_arrow_key_nav()  # ← / → flip options (clicks the ◀ ▶ buttons above)
 
-            with grade_col:
+            if grading_stage:
+              with grade_col:
                 # ── Grade panel — hero (the implied preset) first, then parameters;
                 #    both feed the live preview on the left + Apply (save). Stacked
                 #    single-column since this side panel is narrow.
