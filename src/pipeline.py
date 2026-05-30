@@ -666,11 +666,13 @@ def _graded_output_path(st: Storage, manifest: M.Manifest,
 
 
 def grade_variant(cfg: Config, manifest: M.Manifest,
-                  photo: M.PhotoState, variant_path: str) -> str:
+                  photo: M.PhotoState, variant_path: str,
+                  overrides: Optional[dict] = None) -> str:
     """Grade ONE kept variant against the relevant hero and write a per-variant
     deliverable to <product>/renders/. Records it in photo.graded_variants. Unlike
     the legacy select_variant, this does not single-select — many variants per photo
-    can be graded and kept. Returns the graded output path."""
+    can be graded and kept. `overrides` (e.g. {"strength":0.5,"bg_warmth":3}) tweak the
+    grade Settings on top of the classification preset. Returns the graded output path."""
     if variant_path not in photo.variants:
         raise ValueError(f"variant_path {variant_path} not in variants for {photo.photo_id}")
     st = get_storage(cfg)
@@ -684,7 +686,17 @@ def grade_variant(cfg: Config, manifest: M.Manifest,
         hero_img = _PI.open(st.materialize(hero_resolved)).convert("RGB")
         hero_rgb = np.array(hero_img)
 
-    graded = grade_image(src_bytes, photo.classification or "packshot", hero_rgb=hero_rgb)
+    settings = None
+    if overrides:
+        import dataclasses
+        from .grader import Settings, PACKSHOT_PRESET, WORN_PRESET
+        base = WORN_PRESET if (photo.classification == "worn") else PACKSHOT_PRESET
+        valid = {f.name for f in dataclasses.fields(Settings)}
+        clean = {k: v for k, v in overrides.items() if k in valid}
+        settings = dataclasses.replace(base, **clean)
+
+    graded = grade_image(src_bytes, photo.classification or "packshot",
+                         hero_rgb=hero_rgb, custom_settings=settings)
     out = _graded_output_path(st, manifest, photo, variant_path)
     st.write_bytes(out, graded)
     write_thumb(st, manifest.output_root, out, graded)
@@ -698,11 +710,12 @@ def grade_variant(cfg: Config, manifest: M.Manifest,
 
 
 def submit_grade_variant(cfg: Config, manifest: M.Manifest,
-                         photo: M.PhotoState, variant_path: str) -> Future:
+                         photo: M.PhotoState, variant_path: str,
+                         overrides: Optional[dict] = None) -> Future:
     """Grade one variant in the background grading pool."""
     def _task():
         try:
-            grade_variant(cfg, manifest, photo, variant_path)
+            grade_variant(cfg, manifest, photo, variant_path, overrides=overrides)
         except Exception as e:
             with _MANIFEST_LOCK:
                 photo.last_error = f"Grading failed: {e}"
