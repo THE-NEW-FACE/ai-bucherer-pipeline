@@ -1521,8 +1521,12 @@ def render_sidebar():
                     _close_project()
             with sc2:
                 if st.button("↻ Rescan", use_container_width=True, key="rescan_folder",
-                             help="Re-scan brand folder for new/changed images"):
-                    st.session_state["manifest"] = _load_manifest_for_project(project)
+                             help="Re-list the brand folder for new/changed renders "
+                                  "(normal open uses a cached list for speed)"):
+                    st.session_state["manifest"] = P.ingest(
+                        cfg, project.brand_root, project.output_root,
+                        project=project, force_rescan=True,
+                    )
                     st.rerun()
         else:
             st.markdown(
@@ -1734,28 +1738,16 @@ def render_sidebar():
                             st.toast(f"Hero set for {pg.folder_name}", icon="📌")
                             st.rerun()
 
-        # Maintenance — discovery cache refresh + thumbnail pre-build
+        # Maintenance — thumbnail pre-build (Rescan lives in the identity block above)
         if project and manifest:
             _sb_section("Maintenance")
-            mc1, mc2 = st.columns(2)
-            with mc1:
-                if st.button("↻ Rescan folder", use_container_width=True, key="rescan_folder",
-                             help="Re-list the render folders to pick up newly added renders "
-                                  "(normal open uses a cached list for speed)"):
-                    st.session_state["manifest"] = P.ingest(
-                        cfg, project.brand_root, project.output_root,
-                        project=project, force_rescan=True,
-                    )
-                    st.toast("Folder rescanned.", icon="🔄")
-                    st.rerun()
-            with mc2:
-                if st.button("⚡ Build thumbnails", use_container_width=True, key="build_thumbs",
-                             help="Pre-generate the fast board thumbnails for every current "
-                                  "visual (makes the next open instant)"):
-                    with st.spinner("Building thumbnails…"):
-                        n = _build_all_thumbs(manifest)
-                    st.toast(f"Built {n} thumbnail(s).", icon="⚡")
-                    st.rerun()
+            if st.button("⚡ Build thumbnails", use_container_width=True, key="build_thumbs",
+                         help="Pre-generate the fast board thumbnails for every current "
+                              "visual (makes the next open instant)"):
+                with st.spinner("Building thumbnails…"):
+                    n = _build_all_thumbs(manifest)
+                st.toast(f"Built {n} thumbnail(s).", icon="⚡")
+                st.rerun()
 
         # Keys + model
         st.markdown("---")
